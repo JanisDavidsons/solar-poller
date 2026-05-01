@@ -11,3 +11,7 @@ solar_poller
 
 # Logs
 *.log
+
+# Local-only docs (not for upstream)
+CLAUDE.md
+project-summary*.md

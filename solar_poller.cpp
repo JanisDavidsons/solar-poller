@@ -60,6 +60,11 @@ constexpr float TURN_OFF_THRESHOLD_W = -100.0f;
 constexpr int TURN_ON_DELAY_SEC = 30;
 constexpr int TURN_OFF_DELAY_SEC = 60;
 
+// If no boiler temperature update arrives within this window, treat the
+// last value as untrusted and force the heater off. boiler_poller publishes
+// every 60s, so 300s = 4 missed cycles of headroom.
+constexpr int HOT_WATER_TEMP_STALE_SEC = 300;
+
 // ---------- SDM630 input-register map (0-indexed) ----------
 // Block 1: registers 0..17 (18 registers = 9 floats):
 //   V_L1, V_L2, V_L3, I_L1, I_L2, I_L3, P_L1, P_L2, P_L3
@@ -74,9 +79,12 @@ constexpr int TOTAL_P_COUNT = 2;
 static std::atomic<bool> g_running{true};
 static void on_signal(int) { g_running = false; }
 
-// Latest hot water tank temperature received from home/boiler/temp_cwu (via boiler_poller).
-// Written by the mosquitto network thread, read by the main loop.
+// Latest hot water tank temperature received from home/boiler/temp_hot_water
+// (via boiler_poller). Written by the mosquitto network thread, read by the
+// main loop. `seen_at` is 0 until the first message arrives — anything else
+// is the wall-clock time of the most recent valid reading.
 static std::atomic<float> g_hot_water_temp{0.0f};
+static std::atomic<time_t> g_hot_water_temp_seen_at{0};
 
 // ---------- Helpers ----------
 
@@ -121,6 +129,8 @@ struct HeaterController
     bool on = false;
     time_t below_on_since = 0;
     time_t above_off_since = 0;
+    bool temp_first_seen_logged = false;
+    bool temp_stale = true; // assume stale until first reading arrives
 
     bool init()
     {
@@ -175,8 +185,46 @@ struct HeaterController
     // Pass p_l1 for per-phase logic, p_total for aggregated logic.
     // hot_water_temp: latest hot water tank temperature (°C). Heater will not
     // turn on (and will turn off) if temp is at or above HOT_WATER_MAX_TEMP.
-    void update(float p_decision_w, float hot_water_temp, time_t now)
+    // hot_water_temp_seen_at: wall-clock time of the most recent boiler temp
+    // message (0 = never received). If the value is older than
+    // HOT_WATER_TEMP_STALE_SEC, the heater is forced off — running on a
+    // stale reading risks overshooting the 70°C cap.
+    void update(float p_decision_w, float hot_water_temp,
+                time_t hot_water_temp_seen_at, time_t now)
     {
+        bool have_temp = (hot_water_temp_seen_at != 0);
+        bool is_stale = !have_temp ||
+                        (now - hot_water_temp_seen_at >= HOT_WATER_TEMP_STALE_SEC);
+
+        if (have_temp && !temp_first_seen_logged)
+        {
+            print_timestamp();
+            printf("Hot water temp: first reading %.1f°C\n", hot_water_temp);
+            temp_first_seen_logged = true;
+            temp_stale = false;
+        }
+        else if (is_stale && !temp_stale)
+        {
+            print_timestamp();
+            printf("Hot water temp stale (last update %lds ago) — heater forced OFF\n",
+                   static_cast<long>(now - hot_water_temp_seen_at));
+            temp_stale = true;
+        }
+        else if (!is_stale && temp_stale && temp_first_seen_logged)
+        {
+            print_timestamp();
+            printf("Hot water temp fresh again: %.1f°C\n", hot_water_temp);
+            temp_stale = false;
+        }
+
+        if (is_stale)
+        {
+            if (on)
+                set(false);
+            below_on_since = above_off_since = 0;
+            return;
+        }
+
         if (hot_water_temp >= HOT_WATER_MAX_TEMP)
         {
             if (on)
@@ -254,7 +302,10 @@ static void on_mqtt_message(mosquitto *, void *, const mosquitto_message *msg)
     {
         float temp;
         if (sscanf(static_cast<const char *>(msg->payload), "%f", &temp) == 1)
+        {
             g_hot_water_temp.store(temp);
+            g_hot_water_temp_seen_at.store(time(nullptr));
+        }
     }
 }
 
@@ -413,7 +464,8 @@ int main()
         publish_float(mosq, "power_L3", p_l3);
         publish_float(mosq, "power_total", p_total);
 
-        heater.update(p_l1, g_hot_water_temp.load(), time(nullptr));
+        heater.update(p_l1, g_hot_water_temp.load(),
+                      g_hot_water_temp_seen_at.load(), time(nullptr));
 
         // Publish heater state for monitoring
         char hpayload[2] = {heater.on ? '1' : '0', 0};
