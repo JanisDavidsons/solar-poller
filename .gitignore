@@ -1,0 +1,13 @@
+# Build artefacts
+solar_poller
+*.o
+*.out
+
+# Editor/OS junk
+.DS_Store
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log

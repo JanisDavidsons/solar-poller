@@ -1,0 +1,27 @@
+[Unit]
+Description=Boiler econet24 Poller
+Documentation=file:///home/janis/boiler_poller.py
+After=network-online.target mosquitto.service
+Wants=network-online.target
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+User=janis
+ExecStart=/usr/bin/python3 /home/janis/boiler_poller.py
+
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

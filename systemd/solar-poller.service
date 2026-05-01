@@ -1,0 +1,37 @@
+[Unit]
+Description=Solar SDM630 Modbus Poller
+Documentation=file:///home/janis/solar_poller.cpp
+After=network-online.target mosquitto.service
+Wants=network-online.target
+Requires=mosquitto.service
+
+[Service]
+Type=simple
+User=janis
+Group=dialout
+ExecStart=/usr/local/bin/solar_poller
+SupplementaryGroups=gpio
+
+
+# Restart on crash, but back off so we don't hammer if there's a bug
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Send SIGTERM on stop, give it time to clean up Modbus + MQTT
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Hardening (light touch — Pi has limited resources)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# But it does need to write logs and access /dev/ttyUSB0
+ReadWritePaths=
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
