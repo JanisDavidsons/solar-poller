@@ -18,6 +18,7 @@
 #include <mosquitto.h>
 
 #include <atomic>
+#include <cctype>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -43,27 +44,31 @@ constexpr const char *MQTT_TOPIC_PREFIX = "home/solar";
 
 // ---------- Heater control config ----------
 constexpr const char *GPIO_CHIP_PATH = "/dev/gpiochip0";
-constexpr unsigned int HEATER_GPIO_LINE = 9; // PA9 = physical pin 22
-constexpr float HEATER_LOAD_W = 1300.0f;     // 1.3 kW resistive element
 
-// Decision is made on phase 1 power because the heater is wired to L1.
-// Negative = export. Turn on when L1 export comfortably exceeds the
-// heater's draw; turn off when export drops near zero. Hysteresis timers
-// prevent rapid cycling around the threshold.
-//
-// To switch to total-power decision (if utility does aggregated netting),
-// just pass p_total to heater.update() instead of p_l1 below — thresholds
-// stay the same.
-constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — do not heat above this
-constexpr float TURN_ON_THRESHOLD_W = -(HEATER_LOAD_W); // -1300 W
+// Three single-phase 1.2 kW resistive elements, one per phase, each switched
+// by its own SSR. GPIO line numbers refer to gpiochip0 offsets.
+//   L1: PA9, physical pin 33 — domestic hot water tank
+//   L2: PA8, physical pin 31 — accumulator (buffer) tank
+//   L3: PA7, physical pin 29 — accumulator (buffer) tank
+constexpr unsigned int HEATER_L1_GPIO_LINE = 9;
+constexpr unsigned int HEATER_L2_GPIO_LINE = 8;
+constexpr unsigned int HEATER_L3_GPIO_LINE = 7;
+constexpr float HEATER_LOAD_W = 1200.0f;
+
+// Per-phase decision: each heater is judged on the export of its own phase.
+// Utility meters per-phase, so a phase has to export enough on its own to
+// absorb its heater. Hysteresis timers prevent rapid cycling.
+constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (hot water tank) cap
+constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L2/L3 (accumulator) cap
+constexpr float TURN_ON_THRESHOLD_W = -(HEATER_LOAD_W); // -1200 W
 constexpr float TURN_OFF_THRESHOLD_W = -100.0f;
 constexpr int TURN_ON_DELAY_SEC = 30;
 constexpr int TURN_OFF_DELAY_SEC = 60;
 
 // If no boiler temperature update arrives within this window, treat the
-// last value as untrusted and force the heater off. boiler_poller publishes
-// every 60s, so 300s = 4 missed cycles of headroom.
-constexpr int HOT_WATER_TEMP_STALE_SEC = 300;
+// last value as untrusted and force the affected heater(s) off. boiler_poller
+// publishes every 60s, so 300s = 4 missed cycles of headroom.
+constexpr int TEMP_STALE_SEC = 300;
 
 // ---------- SDM630 input-register map (0-indexed) ----------
 // Block 1: registers 0..17 (18 registers = 9 floats):
@@ -79,12 +84,14 @@ constexpr int TOTAL_P_COUNT = 2;
 static std::atomic<bool> g_running{true};
 static void on_signal(int) { g_running = false; }
 
-// Latest hot water tank temperature received from home/boiler/temp_hot_water
-// (via boiler_poller). Written by the mosquitto network thread, read by the
-// main loop. `seen_at` is 0 until the first message arrives — anything else
-// is the wall-clock time of the most recent valid reading.
+// Latest tank temperatures received via boiler_poller MQTT publishes.
+// Written by the mosquitto network thread, read by the main loop.
+// `seen_at` is 0 until the first message arrives — anything else is the
+// wall-clock time of the most recent valid reading.
 static std::atomic<float> g_hot_water_temp{0.0f};
 static std::atomic<time_t> g_hot_water_temp_seen_at{0};
+static std::atomic<float> g_buffer_upper_temp{0.0f};
+static std::atomic<time_t> g_buffer_upper_temp_seen_at{0};
 
 // ---------- Helpers ----------
 
@@ -118,12 +125,18 @@ static void print_timestamp()
 
 // ---------- Heater controller ----------
 //
-// Owns the libgpiod v2 line request and runs the on/off state machine.
-// On clean shutdown (or crash → systemd cleans up the FD), the line request
-// is released, the kernel returns line 9 to its default state, and the SSR
-// input is no longer driven → heater off (the safe default).
+// One instance per heater. Owns a libgpiod v2 line request on a single
+// gpiochip0 offset and runs an on/off state machine driven by per-phase
+// export power and a tank temperature cap. On clean shutdown (or crash →
+// systemd cleans up the FD), the line request is released, the kernel
+// returns the line to its default state, and the SSR input is no longer
+// driven → heater off (the safe default).
 struct HeaterController
 {
+    const char *name;       // "L1" / "L2" / "L3" — used in log lines
+    unsigned int gpio_line; // gpiochip0 offset for this heater's SSR
+    float temp_cap;         // °C — refuse to heat at or above this
+
     gpiod_chip *chip = nullptr;
     gpiod_line_request *request = nullptr;
     bool on = false;
@@ -137,7 +150,7 @@ struct HeaterController
         chip = gpiod_chip_open(GPIO_CHIP_PATH);
         if (!chip)
         {
-            fprintf(stderr, "gpiod_chip_open(%s) failed\n", GPIO_CHIP_PATH);
+            fprintf(stderr, "[%s] gpiod_chip_open(%s) failed\n", name, GPIO_CHIP_PATH);
             return false;
         }
 
@@ -146,7 +159,7 @@ struct HeaterController
         gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
 
         gpiod_line_config *line_cfg = gpiod_line_config_new();
-        unsigned int offsets[1] = {HEATER_GPIO_LINE};
+        unsigned int offsets[1] = {gpio_line};
         gpiod_line_config_add_line_settings(line_cfg, offsets, 1, settings);
 
         gpiod_request_config *req_cfg = gpiod_request_config_new();
@@ -160,7 +173,8 @@ struct HeaterController
 
         if (!request)
         {
-            fprintf(stderr, "gpiod_chip_request_lines failed: %s\n", strerror(errno));
+            fprintf(stderr, "[%s] gpiod_chip_request_lines(line %u) failed: %s\n",
+                    name, gpio_line, strerror(errno));
             gpiod_chip_close(chip);
             chip = nullptr;
             return false;
@@ -174,46 +188,45 @@ struct HeaterController
             return;
         if (turn_on == on)
             return;
-        gpiod_line_request_set_value(request, HEATER_GPIO_LINE,
+        gpiod_line_request_set_value(request, gpio_line,
                                      turn_on ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE);
         on = turn_on;
         print_timestamp();
-        printf("Heater %s\n", turn_on ? "ON" : "OFF");
+        printf("Heater %s %s\n", name, turn_on ? "ON" : "OFF");
     }
 
-    // p_decision_w: the power reading the state machine evaluates.
-    // Pass p_l1 for per-phase logic, p_total for aggregated logic.
-    // hot_water_temp: latest hot water tank temperature (°C). Heater will not
-    // turn on (and will turn off) if temp is at or above HOT_WATER_MAX_TEMP.
-    // hot_water_temp_seen_at: wall-clock time of the most recent boiler temp
-    // message (0 = never received). If the value is older than
-    // HOT_WATER_TEMP_STALE_SEC, the heater is forced off — running on a
-    // stale reading risks overshooting the 70°C cap.
-    void update(float p_decision_w, float hot_water_temp,
-                time_t hot_water_temp_seen_at, time_t now)
+    // p_decision_w: per-phase power (negative = export) for this heater's phase.
+    // tank_temp: latest tank temperature reading (°C) for the tank this heater
+    // sits in. Heater will not turn on (and will turn off) if temp is at or
+    // above temp_cap.
+    // tank_temp_seen_at: wall-clock time of the most recent temp message
+    // (0 = never received). If older than TEMP_STALE_SEC, the heater is
+    // forced off — running on a stale reading risks overshooting the cap.
+    void update(float p_decision_w, float tank_temp,
+                time_t tank_temp_seen_at, time_t now)
     {
-        bool have_temp = (hot_water_temp_seen_at != 0);
+        bool have_temp = (tank_temp_seen_at != 0);
         bool is_stale = !have_temp ||
-                        (now - hot_water_temp_seen_at >= HOT_WATER_TEMP_STALE_SEC);
+                        (now - tank_temp_seen_at >= TEMP_STALE_SEC);
 
         if (have_temp && !temp_first_seen_logged)
         {
             print_timestamp();
-            printf("Hot water temp: first reading %.1f°C\n", hot_water_temp);
+            printf("[%s] tank temp: first reading %.1f°C\n", name, tank_temp);
             temp_first_seen_logged = true;
             temp_stale = false;
         }
         else if (is_stale && !temp_stale)
         {
             print_timestamp();
-            printf("Hot water temp stale (last update %lds ago) — heater forced OFF\n",
-                   static_cast<long>(now - hot_water_temp_seen_at));
+            printf("[%s] tank temp stale (last update %lds ago) — heater forced OFF\n",
+                   name, static_cast<long>(now - tank_temp_seen_at));
             temp_stale = true;
         }
         else if (!is_stale && temp_stale && temp_first_seen_logged)
         {
             print_timestamp();
-            printf("Hot water temp fresh again: %.1f°C\n", hot_water_temp);
+            printf("[%s] tank temp fresh again: %.1f°C\n", name, tank_temp);
             temp_stale = false;
         }
 
@@ -225,13 +238,13 @@ struct HeaterController
             return;
         }
 
-        if (hot_water_temp >= HOT_WATER_MAX_TEMP)
+        if (tank_temp >= temp_cap)
         {
             if (on)
             {
                 print_timestamp();
-                printf("Heater OFF — hot water at %.1f°C (limit %.0f°C)\n",
-                       hot_water_temp, HOT_WATER_MAX_TEMP);
+                printf("Heater %s OFF — tank at %.1f°C (limit %.0f°C)\n",
+                       name, tank_temp, temp_cap);
                 set(false);
             }
             below_on_since = above_off_since = 0;
@@ -281,7 +294,7 @@ struct HeaterController
     {
         if (request)
         {
-            gpiod_line_request_set_value(request, HEATER_GPIO_LINE, GPIOD_LINE_VALUE_INACTIVE);
+            gpiod_line_request_set_value(request, gpio_line, GPIOD_LINE_VALUE_INACTIVE);
             gpiod_line_request_release(request);
             request = nullptr;
         }
@@ -297,15 +310,21 @@ struct HeaterController
 
 static void on_mqtt_message(mosquitto *, void *, const mosquitto_message *msg)
 {
-    if (msg->payloadlen > 0 &&
-        strcmp(msg->topic, "home/boiler/temp_hot_water") == 0)
+    if (msg->payloadlen <= 0)
+        return;
+    float temp;
+    if (sscanf(static_cast<const char *>(msg->payload), "%f", &temp) != 1)
+        return;
+    time_t now = time(nullptr);
+    if (strcmp(msg->topic, "home/boiler/temp_hot_water") == 0)
     {
-        float temp;
-        if (sscanf(static_cast<const char *>(msg->payload), "%f", &temp) == 1)
-        {
-            g_hot_water_temp.store(temp);
-            g_hot_water_temp_seen_at.store(time(nullptr));
-        }
+        g_hot_water_temp.store(temp);
+        g_hot_water_temp_seen_at.store(now);
+    }
+    else if (strcmp(msg->topic, "home/boiler/temp_upper_buf") == 0)
+    {
+        g_buffer_upper_temp.store(temp);
+        g_buffer_upper_temp_seen_at.store(now);
     }
 }
 
@@ -359,9 +378,10 @@ int main()
         modbus_free(ctx);
         return 1;
     }
-    // Subscribe to boiler temperature for heater cap logic
+    // Subscribe to boiler temperatures for per-heater cap logic
     mosquitto_message_callback_set(mosq, on_mqtt_message);
     mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_hot_water", /*qos=*/0);
+    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_upper_buf", /*qos=*/0);
 
     // Background network thread — handles keepalives/reconnects
     mosquitto_loop_start(mosq);
@@ -370,11 +390,15 @@ int main()
            SERIAL_PORT, POLL_INTERVAL_SEC, "mqtt", MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX);
     printf("Ctrl-C to stop.\n\n");
 
-    HeaterController heater;
-    if (!heater.init())
-    {
-        fprintf(stderr, "Heater control disabled — continuing in monitor-only mode\n");
-    }
+    HeaterController heater_l1{"L1", HEATER_L1_GPIO_LINE, HOT_WATER_MAX_TEMP};
+    HeaterController heater_l2{"L2", HEATER_L2_GPIO_LINE, BUFFER_MAX_TEMP};
+    HeaterController heater_l3{"L3", HEATER_L3_GPIO_LINE, BUFFER_MAX_TEMP};
+    if (!heater_l1.init())
+        fprintf(stderr, "L1 heater control disabled — monitor-only for that phase\n");
+    if (!heater_l2.init())
+        fprintf(stderr, "L2 heater control disabled — monitor-only for that phase\n");
+    if (!heater_l3.init())
+        fprintf(stderr, "L3 heater control disabled — monitor-only for that phase\n");
 
     // Main loop
     int consecutive_failures = 0;
@@ -464,21 +488,37 @@ int main()
         publish_float(mosq, "power_L3", p_l3);
         publish_float(mosq, "power_total", p_total);
 
-        heater.update(p_l1, g_hot_water_temp.load(),
-                      g_hot_water_temp_seen_at.load(), time(nullptr));
+        time_t now = time(nullptr);
+        float hw_t = g_hot_water_temp.load();
+        time_t hw_seen = g_hot_water_temp_seen_at.load();
+        float bu_t = g_buffer_upper_temp.load();
+        time_t bu_seen = g_buffer_upper_temp_seen_at.load();
+        heater_l1.update(p_l1, hw_t, hw_seen, now);
+        heater_l2.update(p_l2, bu_t, bu_seen, now);
+        heater_l3.update(p_l3, bu_t, bu_seen, now);
 
-        // Publish heater state for monitoring
-        char hpayload[2] = {heater.on ? '1' : '0', 0};
-        char htopic[128];
-        snprintf(htopic, sizeof(htopic), "%s/heater_state", MQTT_TOPIC_PREFIX);
-        mosquitto_publish(mosq, nullptr, htopic, 1, hpayload, 0, false);
+        // Publish per-heater state for monitoring
+        const HeaterController *heaters[3] = {&heater_l1, &heater_l2, &heater_l3};
+        for (const HeaterController *h : heaters)
+        {
+            char hpayload[2] = {h->on ? '1' : '0', 0};
+            char htopic[128];
+            // h->name is "L1"/"L2"/"L3"; publish lowercase ("heater_l1_state")
+            // for consistency with the rest of home/solar/*.
+            snprintf(htopic, sizeof(htopic), "%s/heater_%c%c_state",
+                     MQTT_TOPIC_PREFIX,
+                     static_cast<char>(tolower(h->name[0])), h->name[1]);
+            mosquitto_publish(mosq, nullptr, htopic, 1, hpayload, 0, false);
+        }
 
         sleep(POLL_INTERVAL_SEC);
     }
 
     // Cleanup on graceful exit
     printf("\nShutting down...\n");
-    heater.shutdown();
+    heater_l1.shutdown();
+    heater_l2.shutdown();
+    heater_l3.shutdown();
     mosquitto_loop_stop(mosq, /*force=*/true);
     mosquitto_disconnect(mosq);
     mosquitto_destroy(mosq);
