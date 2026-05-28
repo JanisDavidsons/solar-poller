@@ -45,12 +45,16 @@ constexpr const char *MQTT_TOPIC_PREFIX = "home/solar";
 // ---------- Heater control config ----------
 constexpr const char *GPIO_CHIP_PATH = "/dev/gpiochip0";
 
-// Three single-phase 1.2 kW resistive elements, one per phase, each switched
-// by its own SSR. GPIO line numbers refer to gpiochip0 offsets.
-//   L1: PA9, physical pin 33 — domestic hot water tank
-//   L2: PA8, physical pin 31 — accumulator (buffer) tank
-//   L3: PA7, physical pin 29 — accumulator (buffer) tank
+// Four single-phase 1.2 kW resistive elements, each switched by its own SSR.
+// GPIO line numbers refer to gpiochip0 offsets.
+//   L1  (primary)   : PA9,  physical pin 33 — domestic hot water tank
+//   L1b (spillover) : PA10, physical pin 35 — accumulator (buffer) tank
+//   L2              : PA8,  physical pin 31 — accumulator (buffer) tank
+//   L3              : PA7,  physical pin 29 — accumulator (buffer) tank
+// L1 and L1b share phase L1: L1b only runs when the hot water tank is at its
+// cap and the L1 primary is therefore off (see gating in main loop).
 constexpr unsigned int HEATER_L1_GPIO_LINE = 9;
+constexpr unsigned int HEATER_L1B_GPIO_LINE = 10;
 constexpr unsigned int HEATER_L2_GPIO_LINE = 8;
 constexpr unsigned int HEATER_L3_GPIO_LINE = 7;
 constexpr float HEATER_LOAD_W = 1200.0f;
@@ -60,7 +64,10 @@ constexpr float HEATER_LOAD_W = 1200.0f;
 // absorb its heater. Hysteresis timers prevent rapid cycling.
 constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (hot water tank) cap
 constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L2/L3 (accumulator) cap
-constexpr float TURN_ON_THRESHOLD_W = -(HEATER_LOAD_W); // -1200 W
+// Allow a small grid import when turning on: better to pull 300 W from the
+// grid than to keep exporting ~935 W and lose a full heater's worth of surplus.
+constexpr float ACCEPTABLE_IMPORT_W = 100.0f;
+constexpr float TURN_ON_THRESHOLD_W = -(HEATER_LOAD_W - ACCEPTABLE_IMPORT_W); // -1100 W
 constexpr float TURN_OFF_THRESHOLD_W = -100.0f;
 constexpr int TURN_ON_DELAY_SEC = 30;
 constexpr int TURN_OFF_DELAY_SEC = 60;
@@ -304,9 +311,36 @@ struct HeaterController
             chip = nullptr;
         }
     }
+
+    // External hard-off: drop the line and reset hysteresis timers, used when a
+    // higher-level rule disqualifies this heater this cycle (e.g. L1b when the
+    // hot water tank isn't yet at cap).
+    void force_off()
+    {
+        if (on)
+            set(false);
+        below_on_since = above_off_since = 0;
+    }
 };
 
-// ---------- MQTT message callback ----------
+// ---------- MQTT callbacks ----------
+
+// Re-subscribe on every (re)connect. With clean_session=true the broker drops
+// our subscriptions on disconnect, so without this a broker restart or network
+// blip silently kills heater control: publishing keeps working but no temp
+// messages arrive, the temps go stale, and all heaters get forced off.
+static void on_mqtt_connect(mosquitto *mosq, void *, int rc)
+{
+    if (rc != 0)
+    {
+        fprintf(stderr, "MQTT on_connect: rc=%d\n", rc);
+        return;
+    }
+    print_timestamp();
+    printf("MQTT connected — subscribing to boiler temperatures\n");
+    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_hot_water", /*qos=*/0);
+    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_upper_buf", /*qos=*/0);
+}
 
 static void on_mqtt_message(mosquitto *, void *, const mosquitto_message *msg)
 {
@@ -368,6 +402,11 @@ int main()
         mosquitto_lib_cleanup();
         return 1;
     }
+    // Register callbacks before connecting so on_connect fires for the initial
+    // CONNACK too (and re-subscribes us on every later reconnect).
+    mosquitto_connect_callback_set(mosq, on_mqtt_connect);
+    mosquitto_message_callback_set(mosq, on_mqtt_message);
+
     if (mosquitto_connect(mosq, MQTT_HOST, MQTT_PORT, 60) != MOSQ_ERR_SUCCESS)
     {
         fprintf(stderr, "MQTT connect to %s:%d failed. Is mosquitto running?\n",
@@ -378,23 +417,23 @@ int main()
         modbus_free(ctx);
         return 1;
     }
-    // Subscribe to boiler temperatures for per-heater cap logic
-    mosquitto_message_callback_set(mosq, on_mqtt_message);
-    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_hot_water", /*qos=*/0);
-    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_upper_buf", /*qos=*/0);
 
-    // Background network thread — handles keepalives/reconnects
+    // Background network thread — handles keepalives/reconnects.
+    // on_mqtt_connect re-subscribes to boiler temps on every (re)connect.
     mosquitto_loop_start(mosq);
 
     printf("Polling SDM630 at %s every %d seconds. Publishing to %s://%s:%d under %s/*\n",
            SERIAL_PORT, POLL_INTERVAL_SEC, "mqtt", MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX);
     printf("Ctrl-C to stop.\n\n");
 
-    HeaterController heater_l1{"L1", HEATER_L1_GPIO_LINE, HOT_WATER_MAX_TEMP};
-    HeaterController heater_l2{"L2", HEATER_L2_GPIO_LINE, BUFFER_MAX_TEMP};
-    HeaterController heater_l3{"L3", HEATER_L3_GPIO_LINE, BUFFER_MAX_TEMP};
+    HeaterController heater_l1 {"L1",  HEATER_L1_GPIO_LINE,  HOT_WATER_MAX_TEMP};
+    HeaterController heater_l1b{"L1b", HEATER_L1B_GPIO_LINE, BUFFER_MAX_TEMP};
+    HeaterController heater_l2 {"L2",  HEATER_L2_GPIO_LINE,  BUFFER_MAX_TEMP};
+    HeaterController heater_l3 {"L3",  HEATER_L3_GPIO_LINE,  BUFFER_MAX_TEMP};
     if (!heater_l1.init())
         fprintf(stderr, "L1 heater control disabled — monitor-only for that phase\n");
+    if (!heater_l1b.init())
+        fprintf(stderr, "L1b heater control disabled — spillover unavailable\n");
     if (!heater_l2.init())
         fprintf(stderr, "L2 heater control disabled — monitor-only for that phase\n");
     if (!heater_l3.init())
@@ -493,21 +532,36 @@ int main()
         time_t hw_seen = g_hot_water_temp_seen_at.load();
         float bu_t = g_buffer_upper_temp.load();
         time_t bu_seen = g_buffer_upper_temp_seen_at.load();
+
         heater_l1.update(p_l1, hw_t, hw_seen, now);
         heater_l2.update(p_l2, bu_t, bu_seen, now);
         heater_l3.update(p_l3, bu_t, bu_seen, now);
 
+        // L1 spillover: only allowed to consider running when the hot water tank
+        // is known-fresh AND at/above its cap. Otherwise the L1 primary owns the
+        // phase's surplus, and L1b stays off so the two don't compete for it.
+        bool hw_fresh = (hw_seen != 0 && (now - hw_seen) < TEMP_STALE_SEC);
+        bool hw_at_cap = hw_fresh && hw_t >= HOT_WATER_MAX_TEMP;
+        if (hw_at_cap)
+            heater_l1b.update(p_l1, bu_t, bu_seen, now);
+        else
+            heater_l1b.force_off();
+
         // Publish per-heater state for monitoring
-        const HeaterController *heaters[3] = {&heater_l1, &heater_l2, &heater_l3};
+        const HeaterController *heaters[4] = {&heater_l1, &heater_l1b, &heater_l2, &heater_l3};
         for (const HeaterController *h : heaters)
         {
             char hpayload[2] = {h->on ? '1' : '0', 0};
             char htopic[128];
-            // h->name is "L1"/"L2"/"L3"; publish lowercase ("heater_l1_state")
-            // for consistency with the rest of home/solar/*.
-            snprintf(htopic, sizeof(htopic), "%s/heater_%c%c_state",
-                     MQTT_TOPIC_PREFIX,
-                     static_cast<char>(tolower(h->name[0])), h->name[1]);
+            // h->name is "L1"/"L1b"/"L2"/"L3"; publish lowercase
+            // ("heater_l1_state", "heater_l1b_state") for consistency with
+            // the rest of home/solar/*.
+            char name_lc[8] = {0};
+            for (size_t j = 0; j + 1 < sizeof(name_lc) && h->name[j]; j++)
+                name_lc[j] = static_cast<char>(
+                    tolower(static_cast<unsigned char>(h->name[j])));
+            snprintf(htopic, sizeof(htopic), "%s/heater_%s_state",
+                     MQTT_TOPIC_PREFIX, name_lc);
             mosquitto_publish(mosq, nullptr, htopic, 1, hpayload, 0, false);
         }
 
@@ -517,6 +571,7 @@ int main()
     // Cleanup on graceful exit
     printf("\nShutting down...\n");
     heater_l1.shutdown();
+    heater_l1b.shutdown();
     heater_l2.shutdown();
     heater_l3.shutdown();
     mosquitto_loop_stop(mosq, /*force=*/true);
