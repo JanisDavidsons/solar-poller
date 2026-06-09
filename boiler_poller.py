@@ -2,9 +2,13 @@
 """
 boiler_poller.py
 
-Polls econet24.com for boiler/buffer/CWU temperatures every 60 seconds and
-publishes them to MQTT. Intended to run as a systemd service alongside
-solar_poller.
+Polls the Plum ecoNET 300 module on the LAN for boiler/buffer/CWU
+temperatures every 60 seconds and publishes them to MQTT. Intended to
+run as a systemd service alongside solar_poller.
+
+Reads directly from the controller's local web interface
+(http://<ip>/econet/regParams) using HTTP Basic Auth. No internet
+dependency, no rotating session cookies.
 
 Topics published (under home/boiler/):
   temp_hot_water   — domestic hot water tank temp (°C)
@@ -31,19 +35,10 @@ import paho.mqtt.client as mqtt
 import requests
 
 # ---------- Config ----------
-ECONET_URL    = "https://econet24.com/service/getDeviceParams"
-ECONET_UID    = "3G49NB0P32D9K0SB00500"
-ECONET_COOKIE = (
-    'csrftoken=ch27diYjpY44zjXhLC1OY5M5qk1EHCbB; '
-    '_mlmlc="b798b0ed-6c3c-4d75-ac0f-37d0cd85363a?'
-    '2e393dd6-3964-4eff-abf7-4fb8889fe723?B?69F323EC%'
-    '9085790999d2bf11e040714948a09a0f167184e3f4d84ada08fbf40b5d5f0230?'
-    'w:NPL0WH9f7yQA3aji_zHUT39E3B3Qep8ASKT1FC5ERA0"'
-)
-HEADERS = {
-    "X-Requested-With": "XMLHttpRequest",
-    "Cookie": ECONET_COOKIE,
-}
+# Plum ecoNET 300 module on the LAN. Same data the cloud sees, but no
+# auth dance: just HTTP Basic with the module's web UI credentials.
+ECONET_URL  = "http://192.168.8.3/econet/regParams"
+ECONET_AUTH = ("admin", "admin")
 
 MQTT_HOST   = "localhost"
 MQTT_PORT   = 1883
@@ -62,6 +57,12 @@ FIELD_MAP = {
     "fuelLevel":       "fuel_level",
     "mode":            "mode",
 }
+
+# Fields solar_poller relies on for heater control. If any of these come
+# back null (sensor unplugged / controller in a state that doesn't report
+# them), the heater stack will stale-out and force every element off — so
+# treat the fetch as a failure even though the HTTP layer succeeded.
+CRITICAL_FIELDS = ("tempCWU", "tempUpperBuffer")
 
 # ---------- Setup ----------
 logging.basicConfig(
@@ -96,13 +97,11 @@ def fetch_once():
     try:
         resp = requests.get(
             ECONET_URL,
-            params={"uid": ECONET_UID},
-            headers=HEADERS,
+            auth=ECONET_AUTH,
             timeout=HTTP_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("curr", {})
+        return resp.json().get("curr", {})
     except requests.RequestException as e:
         log.warning("HTTP fetch failed: %s", e)
         return None
@@ -110,8 +109,8 @@ def fetch_once():
         log.warning("JSON parse failed: %s", e)
         return None
 
-log.info("Polling econet24 every %ds, publishing to %s://%s:%d under %s/*",
-         POLL_INTERVAL_SEC, "mqtt", MQTT_HOST, MQTT_PORT, MQTT_PREFIX)
+log.info("Polling %s every %ds, publishing to %s://%s:%d under %s/*",
+         ECONET_URL, POLL_INTERVAL_SEC, "mqtt", MQTT_HOST, MQTT_PORT, MQTT_PREFIX)
 
 consecutive_failures = 0
 
@@ -122,27 +121,42 @@ while running:
         publish("online", 0)
         # Backoff: keep trying every minute, but log loudly after sustained failure
         if consecutive_failures == 5:
-            log.error("5 consecutive fetch failures — cookies may have expired")
+            log.error("5 consecutive fetch failures — ecoNET module unreachable "
+                      "or credentials wrong (check %s)", ECONET_URL)
     else:
-        if consecutive_failures > 0:
-            log.info("Recovered after %d failure(s)", consecutive_failures)
-        consecutive_failures = 0
-        publish("online", 1)
-
+        # Publish whatever fields we did get — non-critical fields like
+        # mode/fuel_level are still useful even when temps are missing.
         for field, sub_topic in FIELD_MAP.items():
             val = curr.get(field)
             if val is None:
                 continue
             publish(sub_topic, val)
 
-        # One-line summary log so journalctl shows a heartbeat
-        hot_water = curr.get("tempCWU")
-        upper = curr.get("tempUpperBuffer")
-        lower = curr.get("tempLowerBuffer")
-        log.info("hot_water=%.1f°C upper=%.1f°C lower=%.1f°C",
-                 hot_water if hot_water else 0,
-                 upper if upper else 0,
-                 lower if lower else 0)
+        missing = [f for f in CRITICAL_FIELDS if curr.get(f) is None]
+        if missing:
+            consecutive_failures += 1
+            publish("online", 0)
+            log.warning("Response missing critical field(s): %s — heater control will stale out",
+                        ", ".join(missing))
+            if consecutive_failures == 5:
+                log.error("5 consecutive fetches with missing critical fields — "
+                          "controller may have stopped reporting (sensor "
+                          "unplugged or controller in an unusual state).")
+        else:
+            if consecutive_failures > 0:
+                log.info("Recovered after %d failure(s)", consecutive_failures)
+            consecutive_failures = 0
+            publish("online", 1)
+
+        # One-line summary log so journalctl shows a heartbeat. Render
+        # missing fields as "<missing>" rather than collapsing them to 0.0,
+        # which would mask the viewer-gone failure mode.
+        def fmt(v):
+            return f"{v:.1f}°C" if v is not None else "<missing>"
+        log.info("hot_water=%s upper=%s lower=%s",
+                 fmt(curr.get("tempCWU")),
+                 fmt(curr.get("tempUpperBuffer")),
+                 fmt(curr.get("tempLowerBuffer")))
 
     # Sleep in 1-second chunks so SIGTERM gets responded to within 1s
     for _ in range(POLL_INTERVAL_SEC):
