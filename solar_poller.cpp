@@ -54,17 +54,30 @@ constexpr const char *GPIO_CHIP_PATH = "/dev/gpiochip0";
 // active_low on the line. Everything above that layer keeps writing
 // 1 = heat / 0 = off, and no decision logic knows about the polarity.
 //
-// GPIO line numbers refer to gpiochip0 offsets.
-//   L1  (primary)   : PA9,  physical pin 33 — domestic hot water tank
-//   L1b (spillover) : PA10, physical pin 35 — accumulator (buffer) tank
-//   L2              : PA8,  physical pin 31 — accumulator (buffer) tank
-//   L3              : PA7,  physical pin 29 — accumulator (buffer) tank
-// L1 and L1b share phase L1: L1b only runs when the hot water tank is at its
-// cap and the L1 primary is therefore off (see gating in main loop).
+// Controller names are PHASE names, not element positions: "L2" means the
+// controller deciding on p_l2, whichever element happens to hang off it.
+//
+// Full line -> phase -> element mapping, measured live 2026-09-21 with relay
+// LEDs against per-phase power jumps. This replaces the assumed mapping
+// carried since 2026-08-31, under which L1b and L3 had their elements the
+// wrong way round (top vs middle) and three of the four line numbers were
+// wrong. GPIO line numbers are gpiochip0 offsets.
+//
+//   ctrl  line  pin        phase  element               R        load
+//   L1    9     PA9  (33)  L1     domestic hot water    44.7 ohm 1245 W
+//   L1b   7     PA7  (29)  L1     buffer MIDDLE         45.0 ohm 1240 W
+//   L2    10    PA10 (35)  L2     buffer BOTTOM         35.7 ohm 1560 W
+//   L3    8     PA8  (31)  L3     buffer TOP            44.7 ohm 1245 W
+//
+// L1 and L1b still share phase L1, so the gating is unchanged: L1b only runs
+// when the hot water tank is at its cap and the L1 primary is therefore off
+// (see gating in main loop). Sensor and cap bindings follow the element's
+// role, not its line: DHW takes temp_hot_water and the 70 C cap, all three
+// buffer elements take temp_upper_buf and the 85 C cap.
 constexpr unsigned int HEATER_L1_GPIO_LINE = 9;
-constexpr unsigned int HEATER_L1B_GPIO_LINE = 10;
-constexpr unsigned int HEATER_L2_GPIO_LINE = 8;
-constexpr unsigned int HEATER_L3_GPIO_LINE = 7;
+constexpr unsigned int HEATER_L1B_GPIO_LINE = 7;
+constexpr unsigned int HEATER_L2_GPIO_LINE = 10;
+constexpr unsigned int HEATER_L3_GPIO_LINE = 8;
 // ---------- Per-heater element loads ----------
 // Each element's own draw sets both of its switching pivots, so these are
 // per-heater and meant to be edited in place: change the number and the
@@ -75,24 +88,25 @@ constexpr unsigned int HEATER_L3_GPIO_LINE = 7;
 // switch-transition estimates, which had L1 at 1236 W and L2 at 1566 W. The
 // two methods agree: 35.7 ohm at 236 V gives 1560 W against the 1566 W
 // observed, so the earlier 27% spread was real after all and not measurement
-// error. Three elements are ~1240 W and one is a 1.5 kW element that was
+// error. Three elements are 1240-1245 W and one is a 1.5 kW element that was
 // sold as a 1.2 kW unit.
 //
-// CAVEAT, still open: which element sits on which phase is the working
-// assumption from 2026-08-31, not a verified mapping. The 1560 W element
-// appears to be on L2. A live line-to-phase-to-element test is pending; only
-// the L2 figure changes materially if that assumption is wrong, because the
-// other three are within 5 W of each other.
-constexpr float HEATER_LOAD_L1_W = 1240.0f;  // DHW element, 2026-09-21; agrees with 1236 W measured 2026-08-31
-constexpr float HEATER_LOAD_L1B_W = 1245.0f; // buffer top, 44.7 ohm @ 236 V, 2026-09-21; phase assignment assumed
-constexpr float HEATER_LOAD_L2_W = 1560.0f;  // buffer bottom, 35.7 ohm @ 236 V, 2026-09-21; mis-sold 1.5 kW element
-constexpr float HEATER_LOAD_L3_W = 1240.0f;  // buffer middle, 45.0 ohm @ 236 V, 2026-09-21; phase assignment assumed
+// Which element each controller drives is measured, not assumed, as of the
+// live line-to-phase-to-element test on 2026-09-21; see the mapping table
+// above. Keep each constant paired with the element named on its line: if
+// the panel is rewired, the table and these move together.
+constexpr float HEATER_LOAD_L1_W = 1245.0f;  // DHW, 44.7 ohm @ 236 V, 2026-09-21
+constexpr float HEATER_LOAD_L1B_W = 1240.0f; // buffer MIDDLE, 45.0 ohm @ 236 V, 2026-09-21
+constexpr float HEATER_LOAD_L2_W = 1560.0f;  // buffer BOTTOM, 35.7 ohm @ 236 V, 2026-09-21; mis-sold 1.5 kW element
+constexpr float HEATER_LOAD_L3_W = 1245.0f;  // buffer TOP, 44.7 ohm @ 236 V, 2026-09-21
 
 // Per-phase decision: each heater is judged on the export of its own phase.
 // Utility meters per-phase, so a phase has to export enough on its own to
 // absorb its heater. Hysteresis timers prevent rapid cycling.
-constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (hot water tank) cap
-constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L2/L3 (accumulator) cap
+// Caps bind to the element's role, not its GPIO line: the DHW element takes
+// the hot water cap, all three buffer elements take the accumulator cap.
+constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (DHW tank) cap
+constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L1b/L2/L3 (accumulator) cap
 // ---------- Break-even economics (VAT-inclusive, cents/kWh) ----------
 // Running an element is worth it only when the solar+grid mix costs no more
 // than the pellets it displaces. Every kWh diverted to a heater is a kWh we
