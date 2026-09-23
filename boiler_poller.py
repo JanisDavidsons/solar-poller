@@ -55,6 +55,7 @@ FIELD_MAP = {
     "tempLowerBuffer": "temp_lower_buf",
     "tempCO":          "temp_co",
     "fuelLevel":       "fuel_level",
+    "fuelStream":      "fuel_stream",
     "mode":            "mode",
 }
 
