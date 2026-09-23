@@ -15,3 +15,6 @@ solar_poller
 # Local-only docs (not for upstream)
 CLAUDE.md
 project-summary*.md
+*.pdf
+260921_*.md
+heating-strategy-*.md
