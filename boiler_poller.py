@@ -60,6 +60,7 @@ FIELD_MAP = {
     "boilerPowerKW":   "boiler_power_kw",
     "fanPower":        "fan_power",
     "tempFeeder":      "temp_feeder",
+    "tempFlueGas":     "temp_flue_gas",
     "feederWorks":     "feeder_works",
     "fanWorks":        "fan_works",
     "mode":            "mode",
