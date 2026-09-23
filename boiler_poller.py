@@ -56,6 +56,12 @@ FIELD_MAP = {
     "tempCO":          "temp_co",
     "fuelLevel":       "fuel_level",
     "fuelStream":      "fuel_stream",
+    "boilerPower":     "boiler_power",
+    "boilerPowerKW":   "boiler_power_kw",
+    "fanPower":        "fan_power",
+    "tempFeeder":      "temp_feeder",
+    "feederWorks":     "feeder_works",
+    "fanWorks":        "fan_works",
     "mode":            "mode",
 }
 
@@ -89,7 +95,12 @@ mqttc.loop_start()
 def publish(sub_topic, value):
     """Publish with retain=True so subscribers see the latest value immediately."""
     topic = f"{MQTT_PREFIX}/{sub_topic}"
-    payload = f"{value:.2f}" if isinstance(value, float) else str(value)
+    if isinstance(value, bool):
+        payload = "1" if value else "0"   # Telegraf parses bare numbers only
+    elif isinstance(value, float):
+        payload = f"{value:.2f}"
+    else:
+        payload = str(value)
     mqttc.publish(topic, payload, qos=0, retain=True)
 
 # ---------- Poll loop ----------
