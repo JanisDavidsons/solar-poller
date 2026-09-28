@@ -72,8 +72,10 @@ constexpr const char *GPIO_CHIP_PATH = "/dev/gpiochip0";
 // L1 and L1b still share phase L1, so the gating is unchanged: L1b only runs
 // when the hot water tank is at its cap and the L1 primary is therefore off
 // (see gating in main loop). Sensor and cap bindings follow the element's
-// role, not its line: DHW takes temp_hot_water and the 70 C cap, all three
-// buffer elements take temp_upper_buf and the 85 C cap.
+// role, not its line: DHW takes temp_hot_water and the 70 C cap, L1b and L3
+// take temp_upper_buf and the 85 C cap, L2 (bottom) takes temp_lower_buf and
+// a 75 C cap with temp_upper_buf 88 C as a hard stop. Every cap has a resume
+// point 5 C below it.
 constexpr unsigned int HEATER_L1_GPIO_LINE = 9;
 constexpr unsigned int HEATER_L1B_GPIO_LINE = 7;
 constexpr unsigned int HEATER_L2_GPIO_LINE = 10;
@@ -106,7 +108,22 @@ constexpr float HEATER_LOAD_L3_W = 1245.0f;  // buffer TOP, 44.7 ohm @ 236 V, 20
 // Caps bind to the element's role, not its GPIO line: the DHW element takes
 // the hot water cap, all three buffer elements take the accumulator cap.
 constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (DHW tank) cap
-constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L1b/L2/L3 (accumulator) cap
+constexpr float HOT_WATER_RESUME_TEMP = 65.0f;          // °C — L1 may run again below this
+constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L1b/L3 cap on the UPPER probe
+constexpr float BUFFER_RESUME_TEMP = 80.0f;             // °C — L1b/L3 may run again below this
+// L2 sits at the bottom of the buffer and is judged on the LOWER probe: a
+// tank is full when its bottom is hot, not its top. Seen 2026-09-28: top at
+// 85 with the bottom at 55 and all three buffer elements locked out on the
+// upper cap, two thirds of the tank still cold. Water heated at the bottom
+// rises only to the layer of its own temperature, so running L2 under a
+// hot top is safe as long as the top itself stays under the hard limit.
+constexpr float BUFFER_BOTTOM_MAX_TEMP = 75.0f;         // °C — L2 cap on the LOWER probe
+constexpr float BUFFER_BOTTOM_RESUME_TEMP = 70.0f;      // °C — L2 may run again below this
+constexpr float BUFFER_HARD_MAX_TEMP = 88.0f;           // °C — upper probe: L2 forced off above this regardless
+// Every cap has a resume point below it. Without one an element chatters at
+// the cap: off at 85.0, on at 84.9, off again a minute later (L3 on
+// 2026-09-28 14:27 onward). The gap is wide enough that a boiler run does
+// not re-arm an element by itself.
 // ---------- Break-even economics (VAT-inclusive, cents/kWh) ----------
 // Running an element is worth it only when the solar+grid mix costs no more
 // than the pellets it displaces. Every kWh diverted to a heater is a kWh we
@@ -225,6 +242,8 @@ static std::atomic<float> g_hot_water_temp{0.0f};
 static std::atomic<time_t> g_hot_water_temp_seen_at{0};
 static std::atomic<float> g_buffer_upper_temp{0.0f};
 static std::atomic<time_t> g_buffer_upper_temp_seen_at{0};
+static std::atomic<float> g_buffer_lower_temp{0.0f};
+static std::atomic<time_t> g_buffer_lower_temp_seen_at{0};
 
 // ---------- Helpers ----------
 
@@ -283,11 +302,13 @@ struct HeaterController
     const char *name;       // "L1" / "L2" / "L3" — used in log lines
     unsigned int gpio_line; // gpiochip0 offset for this heater's relay input
     float temp_cap;         // °C — refuse to heat at or above this
+    float temp_resume;      // °C — after a cap stop, allow heating again only below this
     float load_w;           // W — this element's own draw, sets both pivots
 
     gpiod_chip *chip = nullptr;
     gpiod_line_request *request = nullptr;
     bool on = false;
+    bool cap_hold = false;  // latched at temp_cap, cleared below temp_resume
     time_t below_on_since = 0;
     time_t above_off_since = 0;
     bool temp_first_seen_logged = false;
@@ -406,12 +427,28 @@ struct HeaterController
             if (on)
             {
                 print_timestamp();
-                printf("Heater %s OFF — tank at %.1f°C (limit %.0f°C)\n",
-                       name, tank_temp, temp_cap);
+                printf("Heater %s OFF — tank at %.1f°C (limit %.0f°C, resumes below %.0f°C)\n",
+                       name, tank_temp, temp_cap, temp_resume);
                 set(false);
             }
+            cap_hold = true;
             below_on_since = above_off_since = 0;
             return false;
+        }
+        if (cap_hold)
+        {
+            if (tank_temp < temp_resume)
+            {
+                print_timestamp();
+                printf("[%s] tank at %.1f°C, below resume point %.0f°C — heater may run again\n",
+                       name, tank_temp, temp_resume);
+                cap_hold = false;
+            }
+            else
+            {
+                below_on_since = above_off_since = 0;
+                return false;
+            }
         }
         return true;
     }
@@ -501,6 +538,22 @@ struct HeaterController
         force_off();
     }
 
+    // Pivots in force for this element right now, published every cycle as
+    // home/solar/heater_<el>_threshold_on / _off so Grafana draws the lines
+    // the binary is actually running with. They step at 06:00 and 16:00 and
+    // follow any later change to PELLET_COST_C or the load constants, so
+    // the dashboard can no longer drift from the code the way the hand-typed
+    // per-panel constants did (found 2026-09-28: L2 and L3 panels had each
+    // other's values after the 09-21 element remap).
+    float active_on_threshold_w(time_t now) const
+    {
+        return turn_on_threshold_w(load_w, is_cheap_window(now) ? GRID_CHEAP_C : GRID_PEAK_C);
+    }
+    float active_off_threshold_w(time_t now) const
+    {
+        return turn_off_threshold_w(load_w, is_cheap_window(now) ? GRID_CHEAP_C : GRID_PEAK_C);
+    }
+
     // One startup line per heater, so the journal records exactly which
     // pivots this binary is running with for each element.
     void log_thresholds() const
@@ -578,6 +631,7 @@ static void on_mqtt_connect(mosquitto *mosq, void *, int rc)
     printf("MQTT connected — subscribing to boiler temperatures\n");
     mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_hot_water", /*qos=*/0);
     mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_upper_buf", /*qos=*/0);
+    mosquitto_subscribe(mosq, nullptr, "home/boiler/temp_lower_buf", /*qos=*/0);
 }
 
 static void on_mqtt_message(mosquitto *, void *, const mosquitto_message *msg)
@@ -597,6 +651,11 @@ static void on_mqtt_message(mosquitto *, void *, const mosquitto_message *msg)
     {
         g_buffer_upper_temp.store(temp);
         g_buffer_upper_temp_seen_at.store(now);
+    }
+    else if (strcmp(msg->topic, "home/boiler/temp_lower_buf") == 0)
+    {
+        g_buffer_lower_temp.store(temp);
+        g_buffer_lower_temp_seen_at.store(now);
     }
 }
 
@@ -664,10 +723,10 @@ int main()
            SERIAL_PORT, POLL_INTERVAL_SEC, "mqtt", MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX);
     printf("Ctrl-C to stop.\n");
 
-    HeaterController heater_l1 {"L1",  HEATER_L1_GPIO_LINE,  HOT_WATER_MAX_TEMP, HEATER_LOAD_L1_W};
-    HeaterController heater_l1b{"L1b", HEATER_L1B_GPIO_LINE, BUFFER_MAX_TEMP,    HEATER_LOAD_L1B_W};
-    HeaterController heater_l2 {"L2",  HEATER_L2_GPIO_LINE,  BUFFER_MAX_TEMP,    HEATER_LOAD_L2_W};
-    HeaterController heater_l3 {"L3",  HEATER_L3_GPIO_LINE,  BUFFER_MAX_TEMP,    HEATER_LOAD_L3_W};
+    HeaterController heater_l1 {"L1",  HEATER_L1_GPIO_LINE,  HOT_WATER_MAX_TEMP,     HOT_WATER_RESUME_TEMP,     HEATER_LOAD_L1_W};
+    HeaterController heater_l1b{"L1b", HEATER_L1B_GPIO_LINE, BUFFER_MAX_TEMP,        BUFFER_RESUME_TEMP,        HEATER_LOAD_L1B_W};
+    HeaterController heater_l2 {"L2",  HEATER_L2_GPIO_LINE,  BUFFER_BOTTOM_MAX_TEMP, BUFFER_BOTTOM_RESUME_TEMP, HEATER_LOAD_L2_W};
+    HeaterController heater_l3 {"L3",  HEATER_L3_GPIO_LINE,  BUFFER_MAX_TEMP,        BUFFER_RESUME_TEMP,        HEATER_LOAD_L3_W};
 
     printf("Break-even thresholds (pellets %.2f c/kWh, export %.2f c/kWh, "
            "grid cheap %.2f / peak %.2f c/kWh):\n",
@@ -735,9 +794,11 @@ int main()
                 time_t hw_seen = g_hot_water_temp_seen_at.load();
                 float bu_t = g_buffer_upper_temp.load();
                 time_t bu_seen = g_buffer_upper_temp_seen_at.load();
+                float bl_t = g_buffer_lower_temp.load();
+                time_t bl_seen = g_buffer_lower_temp_seen_at.load();
                 heater_l1.meter_failure_hold(hw_t, hw_seen, fail_now);
                 heater_l1b.meter_failure_hold(bu_t, bu_seen, fail_now);
-                heater_l2.meter_failure_hold(bu_t, bu_seen, fail_now);
+                heater_l2.meter_failure_hold(bl_t, bl_seen, fail_now);
                 heater_l3.meter_failure_hold(bu_t, bu_seen, fail_now);
             }
 
@@ -834,16 +895,39 @@ int main()
         time_t hw_seen = g_hot_water_temp_seen_at.load();
         float bu_t = g_buffer_upper_temp.load();
         time_t bu_seen = g_buffer_upper_temp_seen_at.load();
+        float bl_t = g_buffer_lower_temp.load();
+        time_t bl_seen = g_buffer_lower_temp_seen_at.load();
 
         heater_l1.update(p_l1, hw_t, hw_seen, now);
-        heater_l2.update(p_l2, bu_t, bu_seen, now);
         heater_l3.update(p_l3, bu_t, bu_seen, now);
 
-        // L1 spillover: only allowed to consider running when the hot water tank
-        // is known-fresh AND at/above its cap. Otherwise the L1 primary owns the
-        // phase's surplus, and L1b stays off so the two don't compete for it.
+        // L2 (buffer bottom) is judged on the lower probe, with the upper
+        // probe as a hard safety limit: the hottest water is always at the
+        // top, whichever element made it. A stale upper reading counts as
+        // unsafe for the same reason.
+        bool bu_fresh = (bu_seen != 0 && (now - bu_seen) < TEMP_STALE_SEC);
+        if (!bu_fresh || bu_t >= BUFFER_HARD_MAX_TEMP)
+        {
+            if (heater_l2.on)
+            {
+                print_timestamp();
+                printf("Heater L2 OFF — buffer top %s (%.1f°C, hard limit %.0f°C)\n",
+                       bu_fresh ? "at hard limit" : "reading stale", bu_t, BUFFER_HARD_MAX_TEMP);
+            }
+            heater_l2.force_off();
+        }
+        else
+        {
+            heater_l2.update(p_l2, bl_t, bl_seen, now);
+        }
+
+        // L1 spillover: only allowed to consider running while the L1 primary
+        // is parked on its hot water cap (latched at 70, released below 65).
+        // Otherwise the L1 primary owns the phase's surplus, and L1b stays
+        // off so the two don't compete for it. Using the latch rather than a
+        // raw >= 70 test keeps L1b eligible through the whole 65–70 hold.
         bool hw_fresh = (hw_seen != 0 && (now - hw_seen) < TEMP_STALE_SEC);
-        bool hw_at_cap = hw_fresh && hw_t >= HOT_WATER_MAX_TEMP;
+        bool hw_at_cap = hw_fresh && heater_l1.cap_hold;
         if (hw_at_cap)
             heater_l1b.update(p_l1, bu_t, bu_seen, now);
         else
@@ -865,6 +949,14 @@ int main()
             snprintf(htopic, sizeof(htopic), "%s/heater_%s_state",
                      MQTT_TOPIC_PREFIX, name_lc);
             mosquitto_publish(mosq, nullptr, htopic, 1, hpayload, 0, false);
+
+            // Active pivots alongside the state, same naming scheme so
+            // Telegraf's heater_<el>_* regex attaches element/phase/label.
+            char sub[64];
+            snprintf(sub, sizeof(sub), "heater_%s_threshold_on", name_lc);
+            publish_float(mosq, sub, h->active_on_threshold_w(now));
+            snprintf(sub, sizeof(sub), "heater_%s_threshold_off", name_lc);
+            publish_float(mosq, sub, h->active_off_threshold_w(now));
         }
 
         sleep(POLL_INTERVAL_SEC);
