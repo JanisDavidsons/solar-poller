@@ -18,3 +18,4 @@ project-summary*.md
 *.pdf
 260921_*.md
 heating-strategy-*.md
+__pycache__/
