@@ -72,10 +72,11 @@ constexpr const char *GPIO_CHIP_PATH = "/dev/gpiochip0";
 // L1 and L1b still share phase L1, so the gating is unchanged: L1b only runs
 // when the hot water tank is at its cap and the L1 primary is therefore off
 // (see gating in main loop). Sensor and cap bindings follow the element's
-// role, not its line: DHW takes temp_hot_water and the 70 C cap, L1b and L3
-// take temp_upper_buf and the 85 C cap, L2 (bottom) takes temp_lower_buf and
-// a 75 C cap with temp_upper_buf 88 C as a hard stop. Every cap has a resume
-// point 5 C below it.
+// role, not its line: DHW takes temp_hot_water and the 70 C cap, L3 takes
+// temp_upper_buf and the 85 C cap, L1b (middle) takes temp_upper_buf with
+// the 88 C hard limit as its cap, L2 (bottom) takes temp_lower_buf and a
+// 75 C cap with temp_upper_buf 88 C as a hard stop. Every cap has a resume
+// point below it.
 constexpr unsigned int HEATER_L1_GPIO_LINE = 9;
 constexpr unsigned int HEATER_L1B_GPIO_LINE = 7;
 constexpr unsigned int HEATER_L2_GPIO_LINE = 10;
@@ -109,8 +110,15 @@ constexpr float HEATER_LOAD_L3_W = 1245.0f;  // buffer TOP, 44.7 ohm @ 236 V, 20
 // the hot water cap, all three buffer elements take the accumulator cap.
 constexpr float HOT_WATER_MAX_TEMP = 70.0f;             // °C — L1 (DHW tank) cap
 constexpr float HOT_WATER_RESUME_TEMP = 65.0f;          // °C — L1 may run again below this
-constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L1b/L3 cap on the UPPER probe
-constexpr float BUFFER_RESUME_TEMP = 80.0f;             // °C — L1b/L3 may run again below this
+constexpr float BUFFER_MAX_TEMP = 85.0f;                // °C — L3 (top element) cap on the UPPER probe
+constexpr float BUFFER_RESUME_TEMP = 80.0f;             // °C — L3 may run again below this
+// L1b sits in the middle of the buffer. There is no middle probe, and the
+// lower probe never sees middle heating, so it is judged on the upper probe
+// like L3, but with the hard limit as its cap: water heated in the middle
+// rises only to its own temperature layer, so the top is the only place a
+// problem could show up, and 88 is still 7 C under the boiler's own STB.
+constexpr float BUFFER_MIDDLE_MAX_TEMP = 88.0f;         // °C — L1b cap on the UPPER probe
+constexpr float BUFFER_MIDDLE_RESUME_TEMP = 85.0f;      // °C — L1b may run again below this
 // L2 sits at the bottom of the buffer and is judged on the LOWER probe: a
 // tank is full when its bottom is hot, not its top. Seen 2026-09-28: top at
 // 85 with the bottom at 55 and all three buffer elements locked out on the
@@ -724,7 +732,7 @@ int main()
     printf("Ctrl-C to stop.\n");
 
     HeaterController heater_l1 {"L1",  HEATER_L1_GPIO_LINE,  HOT_WATER_MAX_TEMP,     HOT_WATER_RESUME_TEMP,     HEATER_LOAD_L1_W};
-    HeaterController heater_l1b{"L1b", HEATER_L1B_GPIO_LINE, BUFFER_MAX_TEMP,        BUFFER_RESUME_TEMP,        HEATER_LOAD_L1B_W};
+    HeaterController heater_l1b{"L1b", HEATER_L1B_GPIO_LINE, BUFFER_MIDDLE_MAX_TEMP, BUFFER_MIDDLE_RESUME_TEMP, HEATER_LOAD_L1B_W};
     HeaterController heater_l2 {"L2",  HEATER_L2_GPIO_LINE,  BUFFER_BOTTOM_MAX_TEMP, BUFFER_BOTTOM_RESUME_TEMP, HEATER_LOAD_L2_W};
     HeaterController heater_l3 {"L3",  HEATER_L3_GPIO_LINE,  BUFFER_MAX_TEMP,        BUFFER_RESUME_TEMP,        HEATER_LOAD_L3_W};
 
