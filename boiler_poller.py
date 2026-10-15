@@ -318,6 +318,26 @@ mqttc.message_callback_add(CMD_BUFFER_END_TOPIC, on_cmd_buffer_end)
 mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 mqttc.loop_start()
 
+# Log lines also to MQTT home/log/boiler-poller as "<I|W|E> <message>", not
+# retained, for Grafana "Logs" (Loki via Telegraf, 2026-10-15). journalctl
+# keeps the full log; lines made while MQTT is down are only there.
+LOG_TOPIC = "home/log/boiler-poller"
+
+class MqttLogHandler(logging.Handler):
+    LEVEL = {logging.INFO: "I", logging.WARNING: "W", logging.ERROR: "E", logging.CRITICAL: "E"}
+
+    def emit(self, record):
+        level = self.LEVEL.get(record.levelno)
+        if level is None or not mqttc.is_connected():
+            return
+        try:
+            mqttc.publish(LOG_TOPIC, f"{level} {record.getMessage()}", qos=0, retain=False)
+        except Exception:
+            self.handleError(record)
+
+log.addHandler(MqttLogHandler())
+log.info("boiler_poller started, log also on %s", LOG_TOPIC)
+
 def publish(sub_topic, value, retain=True):
     """Publish retained by default so subscribers see the latest value
     immediately. Events (buffer_end_overwritten) pass retain=False."""
