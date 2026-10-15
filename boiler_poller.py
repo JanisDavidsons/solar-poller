@@ -18,6 +18,10 @@ Topics published (under home/boiler/):
   temp_co          — central heating water (°C)
   fuel_level       — pellet hopper level (0-9?)
   mode             — burner mode code
+  fuel_type        — 0 wood, 1 pellets (last known value)
+  fuel_type_known  — 1 if fuel_type comes from param 182, 0 if unknown
+  heat_source      — param 182 raw: 0 pellet burner, 1 wood grate, 2 backup
+  flame            — optical flame sensor, % (regParams tempOpticalSensor)
   online           — 1 if last fetch succeeded, 0 if not
 
 The MQTT messages are published with `retain=True` so a fresh subscriber
@@ -53,11 +57,15 @@ ECONET_AUTH = ("admin", "admin")
 #   183 "Automātiska pāreja uz granulām"  auto switch back to pellets
 #    53 "Uzstādītā Katla temperatūra"  boiler setpoint, pellet mode
 #   184 "Uzstādītā Katla temperatūra"  boiler setpoint, grate mode
+#    68 "Katla temp. palielinājums no SKŪ un maisītāja"  boiler setpoint raise, K
+#   182 "Siltuma avots"           heat source: 0 pellet burner, 1 wood grate,
+#                                 2 backup boiler
 # 181 is the user's SELECTION, not the fuel actually burning: on the
-# automatic wood->pellet takeover (2026-09-28 01:20) it stayed at 1. The
-# controller does expose the active fuel indirectly: regParams tempCOSet
-# equals whichever of the two stored setpoints (53 / 184) is active. That
-# comparison drives `fuel_type` below.
+# automatic wood->pellet takeover (2026-09-28 01:20) it stayed at 1. 182 is
+# the active heat source: 1 during the wood burn on 2026-10-14, 0 after the
+# automatic switch to pellets on 10-15. fuel_type comes from 182 (see
+# derive_fuel_type); the older guess from tempCOSet is only a fallback.
+# 182 is editable on the controller: the poller and the panel never write it.
 # Read every poll: grate mode is toggled by hand and we want the timeline
 # to show the change within a minute.
 PARAMS_URL = "http://192.168.8.3/econet/rmParamsData"
@@ -68,17 +76,30 @@ PARAM_MAP = {
     183: "auto_pellet_switch",
     53:  "temp_co_set_pellets",
     184: "temp_co_set_wood",
+    68:  "temp_co_increase",    # input to fuel_type, see derive_fuel_type (2026-10-13)
     48:  "feeder_rate_kg_h",
     187: "exhaust_level",       # "Vilkmes jauda - malkas režīms", % (2026-10-12)
+    186: "blower_level",        # "Vent. Jauda", blower % in grate mode, floor param 36 (40 since 2026-10-14); boiler-panel confirms its writes with it (2026-10-14)
+    182: "heat_source",         # "Siltuma avots", source of fuel_type (2026-10-15)
 }
 PARAMS_EVERY_N_POLLS = 1
 
 # Zero-glitch guard (2026-10-12): rmParamsData now and then answers with
 # zeros. At 00:01 and 00:23 the poller read Buffer loading end as 0, published
-# it and the supervisor wrote over it. Boiler setpoint in grate mode (184) is
-# never 0 in a real answer, so a 0 there (or an empty or short list) marks the
-# whole response as glitched: it is discarded and the previous values stay.
-ZERO_GUARD_IDX = 184
+# it and the supervisor wrote over it. The boiler setpoints (184 grate, 53
+# pellets) are never 0 in a real answer, and a real answer has well over
+# ZERO_GUARD_MIN_NONZERO non-zero values (173 of 206 on 2026-10-14). Failing
+# any of these (or an empty or short list) marks the whole response as
+# glitched: it is discarded and the previous values stay. This matters for
+# 182, where 0 (pellets) is a valid value.
+ZERO_GUARD_IDX = (184, 53)
+ZERO_GUARD_MIN_NONZERO = 50
+
+# fuel_type from 182: a bad read keeps the last good 182 this long; after
+# that fuel_type falls back to the tempCOSet guess, published as unknown.
+HEAT_SOURCE_MAX_AGE_SEC = 600
+HEAT_SOURCE_PELLETS = 0
+HEAT_SOURCE_WOOD = 1
 
 # Pellet consumption. The local module exposes no fuel counter (fuelConsum
 # exists only in the econet24 cloud payload), so we reproduce the
@@ -115,8 +136,10 @@ FUEL_PELLETS = 1
 # loading end in the UI is overwritten within minutes: change the table
 # below instead, or publish an override. Writes use rmNewParam and are read
 # back after 30 s (the module acknowledges writes it then drops).
-# The supervisor is the ONLY writer of 162. The veto-relay panel writes 187
-# only and asks for another buffer end through the override topic.
+# The supervisor is the ONLY writer of 162. The boiler-panel writes 187 and
+# 186 and asks for another buffer end through the override topic. While
+# fuel_type is unknown (fuel_type_known = 0) the supervisor writes nothing
+# except an override.
 #
 # Override: retained JSON on home/boiler/cmd/buffer_end,
 #   {"value": 66, "until": "2026-10-12T22:00:00+03:00"}
@@ -196,6 +219,12 @@ FIELD_MAP = {
     "ecoSterContacts1": "room_demand1",
     "ecoSterContacts3": "room_demand3",
     "mode":            "mode",
+    # Optical flame sensor, % (2026-10-15). The controller declares wood
+    # burnt out when it stays below param 25 (5 %) for param 185 (15 min).
+    # It looks through the pellet burner opening into the firebox: a fresh
+    # wood load covers it (dark, switch to pellets too early), glowing embers
+    # keep it bright (no switch for hours).
+    "tempOpticalSensor": "flame",
 }
 
 # Fields solar_poller relies on for heater control. If any of these come
@@ -333,14 +362,15 @@ def read_params_data():
         log.warning("Params parse failed: %s", e)
         return None
     try:
-        guard = data[ZERO_GUARD_IDX]["value"]
+        guards = {idx: data[idx]["value"] for idx in ZERO_GUARD_IDX}
+        nonzero = sum(1 for p in data if isinstance(p, dict) and p.get("value"))
     except (TypeError, IndexError, KeyError):
         log.warning("Params answer empty or short (%s entries), discarded",
                     len(data) if isinstance(data, list) else "no")
         return None
-    if not guard:
-        log.warning("Params answer has param %d = %r (zero glitch), discarded",
-                    ZERO_GUARD_IDX, guard)
+    if not all(guards.values()) or nonzero < ZERO_GUARD_MIN_NONZERO:
+        log.warning("Params answer has %s, %d non-zero values (zero glitch), discarded",
+                    guards, nonzero)
         return None
     return data
 
@@ -428,27 +458,67 @@ params = None
 last_fuel_type = None
 fuel_stable_polls = 0
 
-def derive_fuel_type(curr, params, last):
-    """Active fuel from tempCOSet vs the two stored setpoints. Returns
-    FUEL_WOOD / FUEL_PELLETS, or `last` when it cannot tell (both setpoints
-    equal, or a field missing)."""
+fuel_unknown_reason = None
+
+def fuel_unknown(reason):
+    """Log why fuel_type is unknown, once per change of reason."""
+    global fuel_unknown_reason
+    if reason != fuel_unknown_reason:
+        log.warning("fuel_type unknown: %s", reason)
+        fuel_unknown_reason = reason
+    return None
+
+heat_source = None           # last good 182
+heat_source_at = float("-inf")  # time.monotonic() of that read
+
+def derive_fuel_type(curr, params, params_fresh):
+    """Return (fuel_type, known). From param 182 (inverted encoding: 182 = 1
+    wood -> FUEL_WOOD 0, 182 = 0 pellets -> FUEL_PELLETS 1), known = True.
+    182 = 2 (backup boiler) or any other value: (None, False). A bad params
+    read keeps the last good 182 for HEAT_SOURCE_MAX_AGE_SEC; after that the
+    tempCOSet guess, with known = False so nothing acts on it."""
+    global heat_source, heat_source_at, fuel_unknown_reason
+    if params_fresh and params.get("heat_source") is not None:
+        heat_source = params["heat_source"]
+        heat_source_at = time.monotonic()
+    if time.monotonic() - heat_source_at <= HEAT_SOURCE_MAX_AGE_SEC:
+        if heat_source in (HEAT_SOURCE_WOOD, HEAT_SOURCE_PELLETS):
+            fuel_unknown_reason = None
+            return (FUEL_WOOD if heat_source == HEAT_SOURCE_WOOD else FUEL_PELLETS), True
+        fuel_unknown(f"heat source 182 = {heat_source}")
+        return None, False
+    fuel_unknown("no good read of 182 for 10 min, guessing from tempCOSet")
+    return guess_fuel_type(curr, params), False
+
+def guess_fuel_type(curr, params):
+    """Fallback: active fuel from tempCOSet vs the setpoint each fuel is
+    expected to show. Returns FUEL_WOOD / FUEL_PELLETS, or None when a field
+    is missing, both expectations match or neither does.
+
+    The controller raises the boiler setpoint to Buffer loading end (162) +
+    param 68 when that is higher than the fuel's own setpoint: since
+    2026-10-12 14:01 tempCOSet read 77 in pellet mode = 72 + 5 (one data
+    point, a hypothesis). Compared with 53/184 alone, 77 matched neither, the
+    old code kept the last value (wood), the supervisor kept 162 = 72 and so
+    kept the setpoint at 77: a self-locking loop charging the buffer to 72
+    on pellets."""
     if not params or curr is None:
-        return last
+        return fuel_unknown("no data this poll")
     active = curr.get("tempCOSet")
-    pellets = params.get("temp_co_set_pellets")
-    wood = params.get("temp_co_set_wood")
-    if active is None or pellets is None or wood is None:
-        return last
-    if pellets == wood:
-        if last is None:
-            log.warning("Pellet and wood setpoints are equal (%s); cannot derive fuel_type", pellets)
-        return last
-    if active == pellets:
-        return FUEL_PELLETS
-    if active == wood:
-        return FUEL_WOOD
-    log.warning("tempCOSet=%s matches neither setpoint (pellets=%s, wood=%s)", active, pellets, wood)
-    return last
+    p53 = params.get("temp_co_set_pellets")
+    p184 = params.get("temp_co_set_wood")
+    p162 = params.get("buffer_end_set")
+    p68 = params.get("temp_co_increase")
+    if None in (active, p53, p184, p162, p68):
+        return fuel_unknown("field missing")
+    raised = p162 + p68
+    pellets_exp = max(p53, raised)
+    wood_exp = max(p184, raised)
+    is_pellets = active == pellets_exp
+    is_wood = active == wood_exp
+    if is_pellets == is_wood:
+        return fuel_unknown(f"tempCOSet={active}, expected pellets={pellets_exp} wood={wood_exp}")
+    return FUEL_PELLETS if is_pellets else FUEL_WOOD
 
 def write_param(idx, value):
     """Write one rmParamsData entry and confirm by read-back. Returns True
@@ -525,10 +595,12 @@ def supervise_buffer_end(fuel_type, params, stable_polls):
 while running:
     # Service parameters: not critical for heater control, so a failure here
     # only logs and leaves `online` alone.
+    params_fresh = False
     if poll_count % PARAMS_EVERY_N_POLLS == 0:
         fetched = fetch_params()
         if fetched:
             params = fetched
+            params_fresh = True
             for topic, val in params.items():
                 publish(topic, val)
     poll_count += 1
@@ -537,16 +609,24 @@ while running:
 
     publish_counters(params)
 
-    fuel_type = derive_fuel_type(curr, params, last_fuel_type)
-    if fuel_type is not None:
-        if fuel_type != last_fuel_type:
-            log.info("fuel_type -> %s", "pellets" if fuel_type == FUEL_PELLETS else "wood")
-            fuel_stable_polls = 0
-        else:
-            fuel_stable_polls += 1
-        publish("fuel_type", fuel_type)
+    # fuel_type is published whenever there is a value (182, or the fallback
+    # guess); only a value from 182 counts as known. Unknown resets the
+    # stability count, so the supervisor and the panel's 186/187 guard only
+    # act on 182. 182 = 2 (backup boiler): no fuel_type at all.
+    fuel_type, fuel_known = derive_fuel_type(curr, params, params_fresh)
+    if fuel_type is not None and fuel_type != last_fuel_type:
+        log.info("fuel_type -> %s (%s)", "pellets" if fuel_type == FUEL_PELLETS else "wood",
+                 "param 182" if fuel_known else "tempCOSet guess")
         last_fuel_type = fuel_type
-    supervise_buffer_end(fuel_type, params, fuel_stable_polls)
+        fuel_stable_polls = 0
+    elif fuel_known:
+        fuel_stable_polls += 1
+    if not fuel_known:
+        fuel_stable_polls = 0
+    if fuel_type is not None:
+        publish("fuel_type", fuel_type)
+    publish("fuel_type_known", 1 if fuel_known else 0)
+    supervise_buffer_end(fuel_type if fuel_known else None, params, fuel_stable_polls)
     if curr is None:
         consecutive_failures += 1
         publish("online", 0)

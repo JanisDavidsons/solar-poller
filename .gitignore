@@ -19,3 +19,4 @@ project-summary*.md
 260921_*.md
 heating-strategy-*.md
 __pycache__/
+influx-read.env

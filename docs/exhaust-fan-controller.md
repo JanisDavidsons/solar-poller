@@ -314,6 +314,41 @@ Phase 3, own combustion control in wood mode:
 - Success measure: kWh/kg per load (the wood yield test), door smoke, number
   of Supervision cycles per load.
 
+## Bench results 2026-10-13 (veto-relay repo, bench firmware)
+
+Repo `~/Projects/veto-relay` on the Mac: copy of diesel_heater_interface
+(Display, calibration, libs kept; CAN sources present, unused), bench
+`src/main.cpp` for the Mega and `esp/` as a second PlatformIO project for
+the NodeMCU. Both compile; bench runs from Mega USB alone (PSU off).
+
+- Serial link Mega <-> ESP works: PING/PONG every second, no loss, HELLO
+  every 5 s. A null byte from Mega TX1 at boot precedes the first line;
+  the real firmware must ignore non-printable bytes.
+- Screen is **400x240** (not 480x320). Layout: buttons in two rows of
+  three, 120x48 px; narrower buttons (62 px) were unusable.
+- Touch, measured with this panel on 20-30 cm wires: Adafruit z scales with
+  raw x; left side z 226-488, right side z 148-184 at the same finger
+  pressure, idle < 50. **MINPRESSURE 200 from the diesel code ignores the
+  right half; use 100.** Phantom reads appear at a fixed point (raw x~350,
+  y~711, z~26000) and z drops out briefly while the finger is held.
+  What works (keep in the real firmware): call `getPoint()` twice and use
+  the second; a press counts only when two consecutive reads land on the
+  same button; after an action nothing counts until 300 ms with no touch
+  at all (re-arm). Buttons are static (`initButton` once in setup; state
+  shown by a bar under the button, never re-init in the handler, that
+  re-fires `justPressed` every loop). `SIMPLE_TOUCH 1` in main.cpp gives
+  the plain diesel mechanism for A/B; 0 (the above) judged better on the
+  same wiring.
+- Relays: Mega pins 22..32 drive the HL-56S in reverse order (pin 22 =
+  board LED DS6). Bench main.cpp now uses RELAY[] = {32,30,28,26,24,22}
+  so screen R1..R6 = board DS1..DS6. Not yet confirmed: that the relay
+  switched by screen R1 is the one with the DZT loop on COM+NC. Verify with
+  a multimeter on the DZT wires before the boiler sees it.
+- Cycling relays: releasing one and energising the next in the same instant
+  coincided with "ESP no link" on screen; single presses did not. Bench now
+  waits 300 ms between release and energise; result not yet reported. Rule
+  for the real firmware: never switch two relay coils in the same instant.
+
 ## Hardware on the bench (2026-10-11, supersedes the power/ESP lines above)
 
 - PSU Mean Well RS-15-5, 5 V / 3 A, FG to PE. Measure the output unloaded
@@ -328,6 +363,17 @@ Phase 3, own combustion control in wood mode:
 - NodeMCU LoLin V3 (ESP-12F, CH340) instead of the D1 mini: same role,
   network bridge on Mega Serial1. D pins are 3.3 V: Mega TX1 -> divider
   (2k2/3k3) -> ESP RX; ESP TX -> Mega RX1 direct; common GND.
+  ESP side uses hardware UART0 on its alternate pins (`Serial.swap()` after
+  `Serial.begin(9600)`): D7 (GPIO13) = ESP RX, D8 (GPIO15) = ESP TX. The
+  default RX/TX pins stay with the CH340 for flashing; debug output, if
+  needed, goes to `Serial1` on D4 (TX only). Wiring: Mega pin 18 (TX1) ->
+  2k2 -> D7, 3k3 from D7 to GND; D8 -> Mega pin 19 (RX1). GPIO15 has the
+  board's own pull-down, so the boot-mode constraint is met.
+  Note on Janis's Mega clone: its silkscreen reads "RX1 18 / TX1 19", which
+  is the reverse of the Arduino core (pin 18 = PD3 = TXD1, pin 19 = PD2 =
+  RXD1). Wire by pin number, ignore the TX/RX label. Wired 2026-10-13:
+  2k2 on pin 18, ESP D8 on pin 19, 3k3 between D7 and G on the NodeMCU.
+  Bench check: with `Serial1.begin(9600)` pin 18 idles at 5 V.
 - Mega 2560 + 3.5" MCUFRIEND TFT shield (UNO pin layout, 8-bit parallel).
   Pins taken by the shield, from `diesel_heater_interface/src/main.cpp` and
   the MCUFRIEND_kbv shield defaults: data D2-D9, control A0-A4
@@ -336,11 +382,14 @@ Phase 3, own combustion control in wood mode:
   SD CS D10 (unused now), init `tft.readID()` then `tft.begin(ID)`,
   `setRotation(1)`, calibration TS_LEFT=927, TS_RT=63, TS_TOP=908,
   TS_BOT=125. MCP2515 on D53/SPI is dropped.
-- Free Mega pins for this project: Serial1 D18/D19 (ESP), relays D22-D27
-  (IN1-IN6), physical button D30 with internal pull-up, 1-Wire bus D32
-  with 4k7 to 5 V (both DS18B20), spare D34-D49, A5-A15; D20/D21 (I2C)
-  stay free for a later I2C device. D50-D53 free since the CAN module is
-  gone.
+- Mega pins as wired 2026-10-13 (even pins only, one side of the 36-pin
+  header, easier to solder): Serial1 D18/D19 (ESP); relays IN1-IN6 =
+  D22, D24, D26, D28, D30, D32 (IN1 = D22 carries the DZT loop on COM+NC);
+  1-Wire bus D34 with 4k7 to 5 V (both DS18B20); physical button D36 with
+  internal pull-up (optional); spare D38-D49 and the odd pins, A5-A15;
+  D20/D21 (I2C) stay free for a later I2C device. D50-D53 free since the
+  CAN module is gone. Relay channel for the Regin flap: IN6 = D32 (CH6,
+  farthest from the DZT channel).
 - DS18B20: boiler inlet after the LK 820, and the exhaust fan housing
   (max seen 70 °C, sensor limit 125 °C; silicone or PTFE cable).
 - Loading timer `load_max`: Janis wants 2-3 min, not 15; make it a setting,

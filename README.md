@@ -338,6 +338,45 @@ See "Adding a panel".
 Dated changes to the stack and the things around it that the dashboards
 depend on. Newest first.
 
+### 2026-10-15
+
+- **fuel_type from param 182 "Siltuma avots" (deployed 09:32).** 182 is
+  the active heat source: 0 pellet burner, 1 wood grate, 2 backup boiler
+  (1 during the 10-14 wood burn, 0 after the automatic switch to pellets).
+  fuel_type keeps its meaning (0 wood, 1 pellets, inverted against 182) and
+  is `fuel_type_known` = 1 only when it comes from 182; 182 = 2 publishes no
+  fuel_type. A bad params read keeps the last good 182 for 10 min, then the
+  tempCOSet guess from 10-13 takes over as unknown (supervisor and panel do
+  nothing on it). The zero guard is stricter, since 182 = 0 is valid: 184
+  and 53 must be non-zero and the answer must have at least 50 non-zero
+  values. New topics `heat_source` (182 raw) and `flame` (regParams
+  `tempOpticalSensor`, %: the controller calls wood burnt out when it stays
+  below param 25 = 5 % for param 185 = 15 min). Also `blower_level` (param
+  186, 10-14) for the boiler panel. Checked after deploy: fuel_type 1 =
+  heat_source 0, known 1, no supervisor writes. Full parameter inventory:
+  `docs/ecomax-params-2026-10-14.md`.
+
+### 2026-10-13
+
+- **fuel_type self-lock fixed in boiler_poller (deployed with the 10-15
+  change, where it became the fallback behind param 182).** Since
+  2026-10-12 14:01 `temp_co_set` read 77 in pellet/Halted mode. That fits
+  max(p53, p162 + p68) with 162 = 72 and param 68 ("Katla temp.
+  palielinājums no SKŪ un maisītāja") = 5; one data point, a hypothesis.
+  77 matched neither stored setpoint (75 / 80), the old code kept the last
+  value (wood), so the supervisor held 162 = 72 in pellet mode, which in turn
+  held the setpoint at 77: pellets charged the buffer to 72. Now: pellets
+  expected = max(p53, p162 + p68), wood expected = max(p184, p162 + p68);
+  exactly one must match, otherwise fuel is unknown. On unknown the
+  published `fuel_type` keeps its last value, the new `fuel_type_known`
+  is 0, the stability count restarts and the supervisor writes nothing
+  (an override still applies). Param 68 is read every poll and published
+  as `temp_co_increase`. In 16 days of data the DHW raise never took the
+  pellet setpoint from 75 to 80. If the hypothesis is wrong (e.g. pellets
+  at 75 with 162 = 72), fuel stays unknown and 162 stays where it is:
+  watch `journalctl -u boiler-poller | grep "fuel_type unknown"` after
+  deploy.
+
 ### 2026-10-09
 
 - **Exhaust fan tests.** Atmos UCJ4C82 induced-draft fan on the flue, wood-mode
