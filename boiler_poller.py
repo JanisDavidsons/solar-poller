@@ -81,6 +81,7 @@ PARAM_MAP = {
     187: "exhaust_level",       # "Vilkmes jauda - malkas režīms", % (2026-10-12)
     186: "blower_level",        # "Vent. Jauda", blower % in grate mode, floor param 36 (40 since 2026-10-14); boiler-panel confirms its writes with it (2026-10-14)
     182: "heat_source",         # "Siltuma avots", source of fuel_type (2026-10-15)
+    47:  "grate_fans",          # "Ventilators režģa režīmā" 0/1; 0 stops both fans, boiler-panel uses it for embers
 }
 PARAMS_EVERY_N_POLLS = 1
 
