@@ -82,6 +82,7 @@ PARAM_MAP = {
     186: "blower_level",        # "Vent. Jauda", blower % in grate mode, floor param 36 (40 since 2026-10-14); boiler-panel confirms its writes with it (2026-10-14)
     182: "heat_source",         # "Siltuma avots", source of fuel_type (2026-10-15)
     47:  "grate_fans",          # "Ventilators režģa režīmā" 0/1; 0 stops both fans, boiler-panel uses it for embers
+    194: "exhaust_fan_enabled", # "Vilkmes ventilators" 0/1, set per fuel by supervise_exhaust_fan
 }
 PARAMS_EVERY_N_POLLS = 1
 
@@ -152,6 +153,10 @@ FUEL_PELLETS = 1
 # confirmed write buffer_end_overwritten (the value it replaced; not
 # retained, so a Telegraf reconnect does not replay it as a new event).
 SUPERVISOR_ENABLED = True
+# Exhaust fan (param 194) per fuel: off on pellets (they ran without it before
+# the fan was fitted; at night it is only noise), on for wood at once.
+EXHAUST_FAN_IDX = 194
+EXHAUST_FAN_BY_FUEL = {FUEL_PELLETS: 0, FUEL_WOOD: 1}
 WRITE_URL = "http://192.168.8.3/econet/rmNewParam"
 WRITE_READBACK_SEC = 30
 BUFFER_END_IDX = 162
@@ -580,6 +585,31 @@ def write_param(idx, value):
     log.info("Param %d = %s confirmed", idx, value)
     return True
 
+exhaust_fan_last_fail = float("-inf")
+
+def supervise_exhaust_fan(fuel_type, params, stable_polls):
+    """Param 194 to EXHAUST_FAN_BY_FUEL: wood at once, pellets after the fuel
+    has held SUPERVISOR_SETTLE_POLLS. Unknown fuel: nothing."""
+    global exhaust_fan_last_fail
+    if not SUPERVISOR_ENABLED or not params or fuel_type is None:
+        return
+    target = EXHAUST_FAN_BY_FUEL[fuel_type]
+    current = params.get("exhaust_fan_enabled")
+    if current is None or current == target:
+        return
+    if fuel_type == FUEL_PELLETS and stable_polls < SUPERVISOR_SETTLE_POLLS:
+        return
+    if time.monotonic() - exhaust_fan_last_fail < 120:
+        return
+    log.info("Supervisor: exhaust fan (194) %s -> %s (fuel %s)", current, target,
+             "wood" if fuel_type == FUEL_WOOD else "pellets")
+    if write_param(EXHAUST_FAN_IDX, target):
+        params["exhaust_fan_enabled"] = target
+        publish("exhaust_fan_enabled", target)
+        exhaust_fan_last_fail = float("-inf")
+    else:
+        exhaust_fan_last_fail = time.monotonic()
+
 def supervise_buffer_end(fuel_type, params, stable_polls):
     """Keep Buffer loading end (162) at the override value while one is in
     force, otherwise at the value for the active fuel. Only writer of 162."""
@@ -648,6 +678,7 @@ while running:
         publish("fuel_type", fuel_type)
     publish("fuel_type_known", 1 if fuel_known else 0)
     supervise_buffer_end(fuel_type if fuel_known else None, params, fuel_stable_polls)
+    supervise_exhaust_fan(fuel_type if fuel_known else None, params, fuel_stable_polls)
     if curr is None:
         consecutive_failures += 1
         publish("online", 0)
