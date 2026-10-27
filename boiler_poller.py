@@ -585,6 +585,45 @@ def write_param(idx, value):
     log.info("Param %d = %s confirmed", idx, value)
     return True
 
+# Loading pump stall: in wood mode the controller sometimes leaves the boiler
+# pump off for 6-16 min after a load while the boiler climbs to 80-85 and
+# the buffer is cold (13 of 52 loads 10-13 .. 10-27, with and without the
+# panel's embers), ending in Supervision. Cause unknown; this only reports
+# it: home/boiler/pump_stalled 1/0 and a W log line at the start.
+PUMP_STALL_CO = 72          # boiler at or above this
+PUMP_STALL_BUFFER_K = 10    # buffer top at least this much colder than the boiler
+PUMP_STALL_POLLS = 2        # condition held this many polls (~2 min)
+pump_stall_polls = 0
+pump_stall_since = None
+pump_stall_max_co = 0.0
+
+def watch_loading_pump(curr, params):
+    global pump_stall_polls, pump_stall_since, pump_stall_max_co
+    co, upper, lower = curr.get("tempCO"), curr.get("tempUpperBuffer"), curr.get("tempLowerBuffer")
+    pump, buffer_end = curr.get("pumpCOWorks"), params.get("buffer_end_set") if params else None
+    if None in (co, upper, lower, pump, curr.get("mode")):
+        return
+    stalled = (curr.get("mode") == 3 and co >= PUMP_STALL_CO and not pump
+               and upper <= co - PUMP_STALL_BUFFER_K
+               and (buffer_end is None or lower < buffer_end))
+    if stalled:
+        pump_stall_polls += 1
+        pump_stall_max_co = max(pump_stall_max_co, co)
+        if pump_stall_polls == PUMP_STALL_POLLS:
+            pump_stall_since = time.monotonic() - (PUMP_STALL_POLLS - 1) * POLL_INTERVAL_SEC
+            log.warning("Loading pump off with the boiler hot: boiler %.1f, buffer %.1f/%.1f, "
+                        "Operation, pump_co_works 0 for %d polls", co, upper, lower, PUMP_STALL_POLLS)
+            publish("pump_stalled", 1)
+        return
+    if pump_stall_since is not None:
+        log.info("Loading pump stall over after %d min (boiler max %.1f, now %.1f, pump %s, mode %s)",
+                 round((time.monotonic() - pump_stall_since) / 60), pump_stall_max_co, co,
+                 1 if pump else 0, curr.get("mode"))
+        publish("pump_stalled", 0)
+    elif pump_stall_polls == 0:
+        publish("pump_stalled", 0)
+    pump_stall_polls, pump_stall_since, pump_stall_max_co = 0, None, 0.0
+
 exhaust_fan_last_fail = float("-inf")
 
 def supervise_exhaust_fan(fuel_type, params, stable_polls):
@@ -694,6 +733,7 @@ while running:
             if val is None:
                 continue
             publish(sub_topic, val)
+        watch_loading_pump(curr, params)
 
         missing = [f for f in CRITICAL_FIELDS if curr.get(f) is None]
         if missing:

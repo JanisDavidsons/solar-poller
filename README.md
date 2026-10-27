@@ -42,6 +42,9 @@ MQTT, broker `192.168.8.50:1883`:
   `heater_<el>_threshold_on/_off`; every 5 s, not retained.
 - `home/boiler/<metric>`: regParams fields and the params in `PARAM_MAP`
   (list in `boiler_poller.py`); every 60 s, retained, bare numbers.
+- `home/boiler/pump_stalled`: 1 while the ecoMAX is in Operation, the boiler
+  >= 72, the buffer top 10 K colder, below 162, and the loading pump off for
+  2 polls; W log line at the start, I line with the duration at the end.
 - `home/boiler/cmd/buffer_end`: override for param 162, retained JSON
   `{"value": 66, "until": "2026-10-12T22:00:00+03:00"}`; empty message clears.
 - History: InfluxDB on winsrv (`home` 90 d raw, `home_long` 1-min means and
