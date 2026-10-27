@@ -700,13 +700,21 @@ HEAT_DUMP_URL = "http://192.168.8.3/econet/newParam"
 HEAT_DUMP_FILE = "/var/lib/boiler_poller/heat_dump.json"
 HEAT_DUMP_ON_K = 5          # start: boiler at or above its setpoint - 5
 HEAT_DUMP_BUFFER_K = 3      # and buffer bottom at or above 162 - 3
-HEAT_DUMP_OFF_K = 15        # stop: boiler at or below its setpoint - 15
-HEAT_DUMP_MIN_SEC = 1200    # no stop on temperature in the first 20 min
+# Stop when the fire no longer covers the house: the buffer top 2 K below its
+# peak in this dump (~1.6 kWh). The 19:38 test ran into the burn-out: buffer
+# top 72.8 -> 67.2 in 35 min (~4 kW out with no fire), the room only +0.1,
+# and the boiler held 66-68, so a boiler limit alone would have run 3 h.
+HEAT_DUMP_BUFFER_DROP_K = 2
+HEAT_DUMP_OFF_K = 10        # stop: boiler at or below its setpoint - 10
+HEAT_DUMP_MIN_SEC = 600     # no stop on boiler temperature in the first 10 min
+HEAT_DUMP_PAUSE_SEC = 900   # no new dump this soon after one ends
 HEAT_DUMP_MAX_SEC = 10800   # at most 3 h per dump
 HEAT_DUMP_RAISE_K = 0.4
 HEAT_DUMP_MAX_K = 1.0       # never more than this above the old setpoint
 HEAT_DUMP_WRITES = 5        # tries per value, one per poll
 heat_dump_since = None      # monotonic start, None = off
+heat_dump_ended = float("-inf")
+heat_dump_upper_max = None  # buffer top peak during this dump
 heat_dump_zones = {}        # zone -> {base, target, confirmed, restoring, writes}
 heat_dump_hands_off = set() # zones a person changed during this dump
 
@@ -806,25 +814,32 @@ def heat_dump_zone(n, curr, on):
     heat_dump_write(n, value)
 
 def heat_dump(curr, params, fuel_type):
-    global heat_dump_since
+    global heat_dump_since, heat_dump_ended, heat_dump_upper_max
     co, co_set, lower = curr.get("tempCO"), curr.get("tempCOSet"), curr.get("tempLowerBuffer")
+    upper = curr.get("tempUpperBuffer")
     buffer_end, mode = params.get("buffer_end_set") if params else None, curr.get("mode")
     now = time.monotonic()
     if heat_dump_since is None:
-        if (fuel_type == FUEL_WOOD and mode == 3 and None not in (co, co_set, lower, buffer_end)
+        if (fuel_type == FUEL_WOOD and mode == 3 and None not in (co, co_set, lower, upper, buffer_end)
+                and now - heat_dump_ended >= HEAT_DUMP_PAUSE_SEC
                 and co >= co_set - HEAT_DUMP_ON_K and lower >= buffer_end - HEAT_DUMP_BUFFER_K):
-            heat_dump_since = now
-            log.info("Heat dump on: boiler %.1f/%s, buffer bottom %.1f (162 = %s)", co, co_set, lower, buffer_end)
+            heat_dump_since, heat_dump_upper_max = now, upper
+            log.info("Heat dump on: boiler %.1f/%s, buffer %.1f/%.1f (162 = %s)", co, co_set, upper, lower,
+                     buffer_end)
     else:
+        if upper is not None:
+            heat_dump_upper_max = max(heat_dump_upper_max, upper)
         reason = ("pellets" if fuel_type == FUEL_PELLETS
                   else f"mode {mode}" if mode not in (3, 4)
                   else "3 h" if now - heat_dump_since >= HEAT_DUMP_MAX_SEC
+                  else f"buffer top {upper:.1f}, peak {heat_dump_upper_max:.1f}"
+                  if upper is not None and upper <= heat_dump_upper_max - HEAT_DUMP_BUFFER_DROP_K
                   else f"boiler {co:.1f}" if (co is not None and co_set is not None and co <= co_set - HEAT_DUMP_OFF_K
                                                and now - heat_dump_since >= HEAT_DUMP_MIN_SEC)
                   else None)
         if reason:
             log.info("Heat dump off after %d min (%s)", round((now - heat_dump_since) / 60), reason)
-            heat_dump_since = None
+            heat_dump_since, heat_dump_ended = None, now
             heat_dump_hands_off.clear()
     on = heat_dump_since is not None
     publish("heat_dump", 1 if on else 0)

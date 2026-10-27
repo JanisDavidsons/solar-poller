@@ -46,8 +46,9 @@ MQTT, broker `192.168.8.50:1883`:
   >= 72, the buffer top 10 K colder, below 162, and the loading pump off for
   2 polls; W log line at the start, I line with the duration at the end.
 - `home/boiler/heat_dump`: 1 while the poller sends wood heat into the house
-  (wood, Operation, boiler >= setpoint - 5, buffer bottom >= 162 - 3; off at
-  setpoint - 15 after 20 min, on pellets, or after 3 h). Meanwhile ecoSTER
+  (wood, Operation, boiler >= setpoint - 5, buffer bottom >= 162 - 3; off
+  when the buffer top falls 2 K below its peak, at setpoint - 10 after
+  10 min, on pellets, or after 3 h; 15 min pause after). Meanwhile ecoSTER
   T1/T3 day setpoints (`STER_TEMP_DAY_n` via `newParam`, panels in day mode
   only) are room + 0.4, at most old + 1.0, then written back; a value a
   person sets meanwhile is kept. Old values in
