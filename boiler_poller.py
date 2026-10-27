@@ -164,6 +164,7 @@ BUFFER_END_BY_FUEL = {FUEL_PELLETS: 50, FUEL_WOOD: 72}
 SUPERVISOR_SETTLE_POLLS = 3        # fuel_type must hold this many polls
 SUPERVISOR_RETRY_SEC = 1800        # after a failed write, wait before retrying
 CMD_BUFFER_END_TOPIC = "home/boiler/cmd/buffer_end"
+CMD_EXHAUST_FAN_TOPIC = "home/boiler/cmd/exhaust_fan"
 
 MQTT_HOST   = "localhost"
 MQTT_PORT   = 1883
@@ -311,16 +312,61 @@ def active_override():
     log.info("Buffer end override %s expired at %s", value, until.isoformat())
     return None
 
+# Exhaust fan override, same form on home/boiler/cmd/exhaust_fan:
+# {"value": 0, "until": "2026-10-28T07:00"} keeps 194 off on embers at night
+# (Janis, 2026-10-27: noise for nothing; the panel's probes then use the
+# blower only).
+exhaust_fan_override = None
+
+def on_cmd_exhaust_fan(client, userdata, msg):
+    global exhaust_fan_override, exhaust_fan_last_fail
+    payload = msg.payload.decode("utf-8", "replace").strip()
+    if not payload:
+        with override_lock:
+            exhaust_fan_override = None
+        log.info("Exhaust fan override cleared")
+        return
+    try:
+        cmd = json.loads(payload)
+        value = int(cmd["value"])
+        until = parse_until(str(cmd["until"]))
+        if value not in (0, 1):
+            raise ValueError("value must be 0 or 1")
+    except (ValueError, KeyError, TypeError) as e:
+        log.warning("Ignoring %s payload %r: %s", CMD_EXHAUST_FAN_TOPIC, payload[:200], e)
+        return
+    with override_lock:
+        exhaust_fan_override = (value, until)
+    exhaust_fan_last_fail = float("-inf")
+    log.info("Exhaust fan override %s until %s", value, until.isoformat())
+
+def active_exhaust_fan_override():
+    global exhaust_fan_override
+    with override_lock:
+        ov = exhaust_fan_override
+    if ov is None:
+        return None
+    value, until = ov
+    if datetime.now(timezone.utc) < until:
+        return value
+    with override_lock:
+        if exhaust_fan_override == ov:
+            exhaust_fan_override = None
+    log.info("Exhaust fan override %s expired at %s", value, until.isoformat())
+    return None
+
 def on_connect(client, userdata, flags, rc, properties=None):
     # Subscribe here so a broker reconnect re-subscribes; the retained
     # command is delivered again, so an override survives a restart.
     if rc == 0:
         client.subscribe(CMD_BUFFER_END_TOPIC, qos=1)
+        client.subscribe(CMD_EXHAUST_FAN_TOPIC, qos=1)
 
 # ---------- MQTT ----------
 mqttc = mqtt.Client(client_id="boiler_poller")
 mqttc.on_connect = on_connect
 mqttc.message_callback_add(CMD_BUFFER_END_TOPIC, on_cmd_buffer_end)
+mqttc.message_callback_add(CMD_EXHAUST_FAN_TOPIC, on_cmd_exhaust_fan)
 mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 mqttc.loop_start()
 
@@ -630,18 +676,21 @@ def supervise_exhaust_fan(fuel_type, params, stable_polls):
     """Param 194 to EXHAUST_FAN_BY_FUEL: wood at once, pellets after the fuel
     has held SUPERVISOR_SETTLE_POLLS. Unknown fuel: nothing."""
     global exhaust_fan_last_fail
-    if not SUPERVISOR_ENABLED or not params or fuel_type is None:
+    if not SUPERVISOR_ENABLED or not params:
         return
-    target = EXHAUST_FAN_BY_FUEL[fuel_type]
+    override = active_exhaust_fan_override()
+    if override is None and fuel_type is None:
+        return
+    target = override if override is not None else EXHAUST_FAN_BY_FUEL[fuel_type]
     current = params.get("exhaust_fan_enabled")
     if current is None or current == target:
         return
-    if fuel_type == FUEL_PELLETS and stable_polls < SUPERVISOR_SETTLE_POLLS:
+    if override is None and fuel_type == FUEL_PELLETS and stable_polls < SUPERVISOR_SETTLE_POLLS:
         return
     if time.monotonic() - exhaust_fan_last_fail < 120:
         return
-    log.info("Supervisor: exhaust fan (194) %s -> %s (fuel %s)", current, target,
-             "wood" if fuel_type == FUEL_WOOD else "pellets")
+    log.info("Supervisor: exhaust fan (194) %s -> %s (%s)", current, target,
+             "override" if override is not None else "fuel wood" if fuel_type == FUEL_WOOD else "fuel pellets")
     if write_param(EXHAUST_FAN_IDX, target):
         params["exhaust_fan_enabled"] = target
         publish("exhaust_fan_enabled", target)
