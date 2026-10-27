@@ -45,6 +45,13 @@ MQTT, broker `192.168.8.50:1883`:
 - `home/boiler/pump_stalled`: 1 while the ecoMAX is in Operation, the boiler
   >= 72, the buffer top 10 K colder, below 162, and the loading pump off for
   2 polls; W log line at the start, I line with the duration at the end.
+- `home/boiler/heat_dump`: 1 while the poller sends wood heat into the house
+  (wood, Operation, boiler >= setpoint - 5, buffer bottom >= 162 - 3; off at
+  setpoint - 15 after 20 min, on pellets, or after 3 h). Meanwhile ecoSTER
+  T1/T3 day setpoints (`STER_TEMP_DAY_n` via `newParam`, panels in day mode
+  only) are room + 0.4, at most old + 1.0, then written back; a value a
+  person sets meanwhile is kept. Old values in
+  `/var/lib/boiler_poller/heat_dump.json`.
 - `home/boiler/cmd/buffer_end`: override for param 162, retained JSON
   `{"value": 66, "until": "2026-10-12T22:00:00+03:00"}`; empty message clears.
 - History: InfluxDB on winsrv (`home` 90 d raw, `home_long` 1-min means and

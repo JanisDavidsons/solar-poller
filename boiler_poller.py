@@ -682,6 +682,157 @@ def supervise_buffer_end(fuel_type, params, stable_polls):
     else:
         supervisor_last_fail = time.monotonic()
 
+# Heat dump (Janis, 2026-10-27): on wood with a full buffer the boiler climbs
+# to its setpoint and goes to Supervision (fans stop, the wood smoulders).
+# Raising a room setpoint ends the thermostat's -30 K mixer cut (param 87/89)
+# and the house takes the heat: T3 21.4 -> 21.6 at 19:38 took the boiler from
+# 76.4 to 67.9 in 10 min. The poller raises the ecoSTER day setpoint of T1
+# (floor) and T3 (radiators) to room + HEAT_DUMP_RAISE_K (the thermostat asks
+# for heat only below set - 0.2) while it holds, then writes the old value
+# back. Wood only: on pellets this would burn pellets. Only panels in day
+# mode (ecoSterMode 2), since the write sets STER_TEMP_DAY_n. A setpoint a
+# person changes meanwhile becomes the new value and is left alone. Writes
+# are checked on the next polls (ecoSterSetTempN), as newParam also answers
+# OK and drops writes. The old values are kept in HEAT_DUMP_FILE so a
+# restart still restores them.
+HEAT_DUMP_ZONES = (1, 3)
+HEAT_DUMP_URL = "http://192.168.8.3/econet/newParam"
+HEAT_DUMP_FILE = "/var/lib/boiler_poller/heat_dump.json"
+HEAT_DUMP_ON_K = 5          # start: boiler at or above its setpoint - 5
+HEAT_DUMP_BUFFER_K = 3      # and buffer bottom at or above 162 - 3
+HEAT_DUMP_OFF_K = 15        # stop: boiler at or below its setpoint - 15
+HEAT_DUMP_MIN_SEC = 1200    # no stop on temperature in the first 20 min
+HEAT_DUMP_MAX_SEC = 10800   # at most 3 h per dump
+HEAT_DUMP_RAISE_K = 0.4
+HEAT_DUMP_MAX_K = 1.0       # never more than this above the old setpoint
+HEAT_DUMP_WRITES = 5        # tries per value, one per poll
+heat_dump_since = None      # monotonic start, None = off
+heat_dump_zones = {}        # zone -> {base, target, confirmed, restoring, writes}
+heat_dump_hands_off = set() # zones a person changed during this dump
+
+def heat_dump_save():
+    try:
+        os.makedirs(os.path.dirname(HEAT_DUMP_FILE), exist_ok=True)
+        tmp = HEAT_DUMP_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(n): [z["base"], z["target"]] for n, z in heat_dump_zones.items()}, f)
+        os.replace(tmp, HEAT_DUMP_FILE)
+    except OSError as e:
+        log.warning("Could not save %s: %s", HEAT_DUMP_FILE, e)
+
+def heat_dump_load():
+    """Setpoints raised before a restart: restored unless the dump goes on."""
+    try:
+        with open(HEAT_DUMP_FILE) as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return
+    except (ValueError, OSError) as e:
+        log.warning("%s unreadable: %s", HEAT_DUMP_FILE, e)
+        return
+    for n, (base, target) in saved.items():
+        if target is None:
+            continue
+        heat_dump_zones[int(n)] = {"base": float(base), "target": float(target), "confirmed": True,
+                                   "restoring": True, "writes": 0}
+        log.info("Heat dump: T%s to restore to %.1f after a restart", n, float(base))
+
+def heat_dump_write(n, value):
+    try:
+        resp = requests.get(HEAT_DUMP_URL,
+                            params={"newParamName": f"STER_TEMP_DAY_{n}", "newParamValue": f"{value:.1f}"},
+                            auth=ECONET_AUTH, timeout=HTTP_TIMEOUT_SEC)
+        resp.raise_for_status()
+        if resp.json().get("result") != "OK":
+            log.warning("Write STER_TEMP_DAY_%d=%.1f refused: %s", n, value, resp.text[:200])
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Write STER_TEMP_DAY_%d=%.1f failed: %s", n, value, e)
+
+def heat_dump_zone(n, curr, on):
+    """One poll for one panel: raise, follow the room up, or restore."""
+    set_t, room = curr.get(f"ecoSterSetTemp{n}"), curr.get(f"ecoSterTemp{n}")
+    if set_t is None:
+        return
+    set_t = round(set_t, 1)
+    z = heat_dump_zones.get(n)
+    if z is None:
+        if not on or room is None or curr.get(f"ecoSterMode{n}") != 2 or n in heat_dump_hands_off:
+            return
+        z = {"base": set_t, "target": None, "confirmed": False, "restoring": False, "writes": 0}
+    want = z["base"] if not on else min(z["base"] + HEAT_DUMP_MAX_K, round(room + HEAT_DUMP_RAISE_K, 1))
+    if z["confirmed"] and z["target"] is not None and abs(set_t - z["target"]) >= 0.05 \
+            and abs(set_t - z["base"]) >= 0.05:
+        log.info("Heat dump: T%d set to %.1f by a person, left alone", n, set_t)
+        heat_dump_hands_off.add(n)
+        heat_dump_zones.pop(n, None)
+        heat_dump_save()
+        return
+    if not on:
+        if abs(set_t - z["base"]) < 0.05:
+            if n in heat_dump_zones:
+                log.info("Heat dump: T%d back to %.1f (room %s)", n, z["base"],
+                         f"{room:.1f}" if room is not None else "?")
+                heat_dump_zones.pop(n)
+                heat_dump_save()
+            return
+        if not z["restoring"]:
+            z.update(restoring=True, writes=0)
+    else:
+        if z["restoring"]:          # on again before the old value was back
+            z.update(restoring=False, writes=0)
+        if z["target"] is not None and abs(set_t - z["target"]) < 0.05:
+            if not z["confirmed"]:
+                log.info("Heat dump: T%d = %.1f confirmed (room %.1f, was %.1f)", n, set_t, room, z["base"])
+            z["confirmed"] = True
+            if want <= z["target"] + 0.05:
+                return              # the room follows; raise again as it warms
+        elif z["target"] is None and want <= set_t + 0.05:
+            return                  # room already well below the setpoint
+        if z["target"] is None or want > z["target"] + 0.05:
+            z.update(target=want, confirmed=False, restoring=False, writes=0)
+            heat_dump_zones[n] = z
+            heat_dump_save()
+    value = z["base"] if z["restoring"] else z["target"]
+    if z["writes"] >= HEAT_DUMP_WRITES:
+        if z["writes"] == HEAT_DUMP_WRITES:
+            log.warning("Heat dump: T%d still %.1f after %d writes of %.1f, giving up", n, set_t,
+                        HEAT_DUMP_WRITES, value)
+            z["writes"] += 1
+        return
+    z["writes"] += 1
+    if z["writes"] == 1:
+        log.info("Heat dump: T%d %.1f -> %.1f (room %s)", n, set_t, value,
+                 f"{room:.1f}" if room is not None else "?")
+    heat_dump_write(n, value)
+
+def heat_dump(curr, params, fuel_type):
+    global heat_dump_since
+    co, co_set, lower = curr.get("tempCO"), curr.get("tempCOSet"), curr.get("tempLowerBuffer")
+    buffer_end, mode = params.get("buffer_end_set") if params else None, curr.get("mode")
+    now = time.monotonic()
+    if heat_dump_since is None:
+        if (fuel_type == FUEL_WOOD and mode == 3 and None not in (co, co_set, lower, buffer_end)
+                and co >= co_set - HEAT_DUMP_ON_K and lower >= buffer_end - HEAT_DUMP_BUFFER_K):
+            heat_dump_since = now
+            log.info("Heat dump on: boiler %.1f/%s, buffer bottom %.1f (162 = %s)", co, co_set, lower, buffer_end)
+    else:
+        reason = ("pellets" if fuel_type == FUEL_PELLETS
+                  else f"mode {mode}" if mode not in (3, 4)
+                  else "3 h" if now - heat_dump_since >= HEAT_DUMP_MAX_SEC
+                  else f"boiler {co:.1f}" if (co is not None and co_set is not None and co <= co_set - HEAT_DUMP_OFF_K
+                                               and now - heat_dump_since >= HEAT_DUMP_MIN_SEC)
+                  else None)
+        if reason:
+            log.info("Heat dump off after %d min (%s)", round((now - heat_dump_since) / 60), reason)
+            heat_dump_since = None
+            heat_dump_hands_off.clear()
+    on = heat_dump_since is not None
+    publish("heat_dump", 1 if on else 0)
+    for n in HEAT_DUMP_ZONES:
+        heat_dump_zone(n, curr, on)
+
+heat_dump_load()
+
 while running:
     # Service parameters: not critical for heater control, so a failure here
     # only logs and leaves `online` alone.
@@ -734,6 +885,7 @@ while running:
                 continue
             publish(sub_topic, val)
         watch_loading_pump(curr, params)
+        heat_dump(curr, params, fuel_type if fuel_known else None)
 
         missing = [f for f in CRITICAL_FIELDS if curr.get(f) is None]
         if missing:
