@@ -794,7 +794,9 @@ def supervise_buffer_end(fuel_type, params, stable_polls):
 # are checked on the next polls (ecoSterSetTempN), as newParam also answers
 # OK and drops writes. The old values are kept in HEAT_DUMP_FILE so a
 # restart still restores them.
-HEAT_DUMP_ZONES = (1, 3)
+# Radiators (T3) only: the floor takes little, and STER_TEMP_DAY_1 writes
+# were dropped (10-28 19:47 and 10-29 T1 stayed 20.7, ecoNET limits 0/0).
+HEAT_DUMP_ZONES = (3,)
 HEAT_DUMP_URL = "http://192.168.8.3/econet/newParam"
 HEAT_DUMP_FILE = "/var/lib/boiler_poller/heat_dump.json"
 HEAT_DUMP_ON_K = 5          # start: boiler at or above its setpoint - 5
@@ -839,6 +841,9 @@ def heat_dump_load():
         return
     for n, (base, target) in saved.items():
         if target is None:
+            continue
+        if int(n) not in HEAT_DUMP_ZONES:
+            log.warning("Heat dump: T%s not handled any more, set it to %.1f by hand", n, float(base))
             continue
         heat_dump_zones[int(n)] = {"base": float(base), "target": float(target), "confirmed": True,
                                    "restoring": True, "writes": 0}

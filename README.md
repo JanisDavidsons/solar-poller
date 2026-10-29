@@ -48,10 +48,11 @@ MQTT, broker `192.168.8.50:1883`:
 - `home/boiler/heat_dump`: 1 while the poller sends wood heat into the house
   (wood, Operation, boiler >= setpoint - 5, buffer bottom >= 162 - 3; off
   when the buffer top falls 2 K below its peak, at setpoint - 10 after
-  10 min, on pellets, or after 3 h; 15 min pause after). Meanwhile ecoSTER
-  T1/T3 day setpoints (`STER_TEMP_DAY_n` via `newParam`, panels in day mode
-  only) are room + 0.4, at most old + 1.0, then written back; a value a
-  person sets meanwhile is kept. Old values in
+  10 min, on pellets, or after 3 h; 15 min pause after). Meanwhile the
+  ecoSTER T3 (radiators) day setpoint (`STER_TEMP_DAY_3` via `newParam`,
+  day mode only) is room + 0.4, at most old + 1.0, then written back; a
+  value a person sets meanwhile is kept. Not T1: floor takes little and its
+  writes were dropped. Old values in
   `/var/lib/boiler_poller/heat_dump.json`.
 - Param 194 (exhaust fan on/off): 0 on pellets, 1 on wood, 0 while the
   panel's embers have the fans off (47 = 0, so its probes run on the blower
