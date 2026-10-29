@@ -355,18 +355,34 @@ def active_exhaust_fan_override():
     log.info("Exhaust fan override %s expired at %s", value, until.isoformat())
     return None
 
+# boiler-panel state from its ESP (0 NORMAL, 1 LOADING, 2 POST, 3 IGNITE,
+# 4 KICK). LOADING ends the embers hold on 194 (see embers_exhaust_off).
+PANEL_STATE_TOPIC = "home/boiler/exhaust_state"
+PANEL_LOADING = 1
+panel_loading_at = None  # monotonic time of the last LOADING message
+
+def on_panel_state(client, userdata, msg):
+    global panel_loading_at
+    try:
+        if int(msg.payload.decode("ascii", "replace").strip()) == PANEL_LOADING:
+            panel_loading_at = time.monotonic()
+    except ValueError:
+        pass
+
 def on_connect(client, userdata, flags, rc, properties=None):
     # Subscribe here so a broker reconnect re-subscribes; the retained
     # command is delivered again, so an override survives a restart.
     if rc == 0:
         client.subscribe(CMD_BUFFER_END_TOPIC, qos=1)
         client.subscribe(CMD_EXHAUST_FAN_TOPIC, qos=1)
+        client.subscribe(PANEL_STATE_TOPIC, qos=0)
 
 # ---------- MQTT ----------
 mqttc = mqtt.Client(client_id="boiler_poller")
 mqttc.on_connect = on_connect
 mqttc.message_callback_add(CMD_BUFFER_END_TOPIC, on_cmd_buffer_end)
 mqttc.message_callback_add(CMD_EXHAUST_FAN_TOPIC, on_cmd_exhaust_fan)
+mqttc.message_callback_add(PANEL_STATE_TOPIC, on_panel_state)
 mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 mqttc.loop_start()
 
@@ -672,16 +688,49 @@ def watch_loading_pump(curr, params):
 
 exhaust_fan_last_fail = float("-inf")
 
+# Embers: while the panel has the grate fans off (47 = 0) the exhaust fan is
+# off too, so the panel's probes run on the blower alone. 10-27: probes gave
+# +7 K with and without it; at low % it only pulses loudly (Janis). Held
+# until LOAD WOOD, pellets, or 47 back on for EMBERS_RELEASE_SEC (a probe is
+# 3 min). No new hold within EMBERS_AFTER_LOAD_SEC of LOADING: the poller may
+# still read 47 = 0 before the ESP's write lands.
+EMBERS_RELEASE_SEC = 360
+EMBERS_AFTER_LOAD_SEC = 300
+embers_hold = False
+embers_fans_on_since = None
+
+def embers_exhaust_off(fuel_type, params):
+    global embers_hold, embers_fans_on_since
+    loaded = panel_loading_at is not None and time.monotonic() - panel_loading_at < EMBERS_AFTER_LOAD_SEC
+    if fuel_type != FUEL_WOOD or loaded:
+        if embers_hold:
+            log.info("Embers: exhaust fan hold released (%s)", "LOAD WOOD" if loaded else "fuel not wood")
+        embers_hold, embers_fans_on_since = False, None
+        return False
+    fans = params.get("grate_fans")
+    if fans == 0:
+        if not embers_hold:
+            log.info("Embers: exhaust fan (194) held off while the panel's fans (47) are off")
+        embers_hold, embers_fans_on_since = True, None
+    elif fans == 1 and embers_hold:
+        if embers_fans_on_since is None:
+            embers_fans_on_since = time.monotonic()
+        elif time.monotonic() - embers_fans_on_since >= EMBERS_RELEASE_SEC:
+            log.info("Embers: exhaust fan hold released (fans 47 on for %d min)", EMBERS_RELEASE_SEC // 60)
+            embers_hold, embers_fans_on_since = False, None
+    return embers_hold
+
 def supervise_exhaust_fan(fuel_type, params, stable_polls):
     """Param 194 to EXHAUST_FAN_BY_FUEL: wood at once, pellets after the fuel
-    has held SUPERVISOR_SETTLE_POLLS. Unknown fuel: nothing."""
+    has held SUPERVISOR_SETTLE_POLLS; 0 on embers. Unknown fuel: nothing."""
     global exhaust_fan_last_fail
     if not SUPERVISOR_ENABLED or not params:
         return
     override = active_exhaust_fan_override()
+    embers = embers_exhaust_off(fuel_type, params)
     if override is None and fuel_type is None:
         return
-    target = override if override is not None else EXHAUST_FAN_BY_FUEL[fuel_type]
+    target = override if override is not None else 0 if embers else EXHAUST_FAN_BY_FUEL[fuel_type]
     current = params.get("exhaust_fan_enabled")
     if current is None or current == target:
         return
@@ -690,7 +739,8 @@ def supervise_exhaust_fan(fuel_type, params, stable_polls):
     if time.monotonic() - exhaust_fan_last_fail < 120:
         return
     log.info("Supervisor: exhaust fan (194) %s -> %s (%s)", current, target,
-             "override" if override is not None else "fuel wood" if fuel_type == FUEL_WOOD else "fuel pellets")
+             "override" if override is not None else "embers" if embers
+             else "fuel wood" if fuel_type == FUEL_WOOD else "fuel pellets")
     if write_param(EXHAUST_FAN_IDX, target):
         params["exhaust_fan_enabled"] = target
         publish("exhaust_fan_enabled", target)

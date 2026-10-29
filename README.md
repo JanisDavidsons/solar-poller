@@ -53,8 +53,11 @@ MQTT, broker `192.168.8.50:1883`:
   only) are room + 0.4, at most old + 1.0, then written back; a value a
   person sets meanwhile is kept. Old values in
   `/var/lib/boiler_poller/heat_dump.json`.
-- `home/boiler/cmd/exhaust_fan`: override for param 194 (0/1), same JSON;
-  e.g. exhaust fan off on embers overnight.
+- Param 194 (exhaust fan on/off): 0 on pellets, 1 on wood, 0 while the
+  panel's embers have the fans off (47 = 0, so its probes run on the blower
+  alone); that hold ends on LOAD WOOD (`exhaust_state` 1), pellets, or 47
+  back on for 6 min.
+- `home/boiler/cmd/exhaust_fan`: override for param 194 (0/1), same JSON.
 - `home/boiler/cmd/buffer_end`: override for param 162, retained JSON
   `{"value": 66, "until": "2026-10-12T22:00:00+03:00"}`; empty message clears.
 - History: InfluxDB on winsrv (`home` 90 d raw, `home_long` 1-min means and
